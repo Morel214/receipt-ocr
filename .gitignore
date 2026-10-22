@@ -1,0 +1,24 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables & secrets
+.env
+*.env.local
+
+# SQLite databases & uploaded receipt images
+*.db
+*.sqlite3
+data/uploads/
+data/*.db
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
