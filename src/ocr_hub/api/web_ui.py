@@ -1,4 +1,4 @@
-"""Built-in Web UI Dashboard for managing Telegram bots, destination webhooks, models, and live OCR testing."""
+"""Built-in Web UI Dashboard for managing Telegram bots, destination webhooks, and testing receipt OCR."""
 
 from ocr_hub import config
 
@@ -34,7 +34,7 @@ def render_dashboard_html() -> str:
       padding: 24px;
     }}
     .container {{
-      max-width: 1120px;
+      max-width: 1160px;
       margin: 0 auto;
     }}
     header {{
@@ -64,6 +64,7 @@ def render_dashboard_html() -> str:
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 20px;
+      margin-bottom: 20px;
     }}
     label {{
       display: block;
@@ -143,7 +144,8 @@ def render_dashboard_html() -> str:
       border-radius: 8px;
       overflow-x: auto;
       font-size: 0.82rem;
-      max-height: 360px;
+      max-height: 380px;
+      color: #e2e8f0;
     }}
     .actions {{
       display: flex;
@@ -157,6 +159,21 @@ def render_dashboard_html() -> str:
       font-size: 0.85rem;
       color: var(--accent);
     }}
+    table.schema-table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.85rem;
+    }}
+    table.schema-table th, table.schema-table td {{
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      text-align: left;
+    }}
+    table.schema-table th {{
+      background: #0b1120;
+      color: var(--accent);
+    }}
   </style>
 </head>
 <body>
@@ -165,8 +182,8 @@ def render_dashboard_html() -> str:
       <div>
         <h1>🧾 Receipt OCR Hub</h1>
         <div class="sub">
-          Stage 1 OCR Default: <code>{config.OCR_PROVIDER} / {config.OCR_MODEL}</code> &rarr;
-          Stage 2 Classifier Default: <code>{config.CLASSIFIER_PROVIDER} / {config.CLASSIFIER_MODEL}</code>
+          Active Models: <code>Stage 1 OCR = {config.OCR_PROVIDER}/{config.OCR_MODEL}</code> &rarr;
+          <code>Stage 2 Classifier = {config.CLASSIFIER_PROVIDER}/{config.CLASSIFIER_MODEL}</code>
         </div>
       </div>
       <div>
@@ -178,6 +195,7 @@ def render_dashboard_html() -> str:
       <!-- Left: Add / Edit Bot & Destination Form -->
       <div class="card">
         <h2 id="formTitle">➕ Add or Update Bot / User</h2>
+        <div class="sub" style="margin-bottom: 8px;">Configure a Telegram receipt bot and set where the parsed JSON is sent.</div>
         <input type="hidden" id="editBotId" value="" />
 
         <div class="row2">
@@ -191,52 +209,36 @@ def render_dashboard_html() -> str:
           </div>
         </div>
 
-        <label>Telegram Bot Token (from @BotFather — optional for API-only users)</label>
-        <input type="text" id="botToken" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" />
+        <div class="row2">
+          <div>
+            <label>Clean Name Language (Stage 2 Classifier)</label>
+            <select id="botLanguage">
+              <option value="en">English (en)</option>
+              <option value="pl">Polish (pl)</option>
+              <option value="nl">Dutch (nl)</option>
+              <option value="de">German (de)</option>
+              <option value="es">Spanish (es)</option>
+              <option value="fr">French (fr)</option>
+              <option value="it">Italian (it)</option>
+            </select>
+          </div>
+          <div>
+            <label>Telegram Bot Token (optional for API-only)</label>
+            <input type="text" id="botToken" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" />
+          </div>
+        </div>
 
-        <label>Destination Webhook URL (where confirmed receipt JSON is POSTed)</label>
+        <label>Destination Webhook URL (where final receipt JSON is POSTed upon confirmation)</label>
         <input type="text" id="webhookUrl" placeholder="http://100.x.y.z:8000/api/receipts/webhook" />
 
         <label>Destination Webhook Bearer Secret (optional)</label>
         <input type="text" id="webhookSecret" placeholder="Optional Authorization Bearer token" />
 
-        <div class="row2">
-          <div>
-            <label>Stage 1 OCR Provider (optional override)</label>
-            <select id="ocrProvider">
-              <option value="">Default ({config.OCR_PROVIDER})</option>
-              <option value="openai">openai</option>
-              <option value="gemini">gemini</option>
-              <option value="openrouter">openrouter</option>
-            </select>
-          </div>
-          <div>
-            <label>Stage 1 OCR Model (optional override)</label>
-            <input type="text" id="ocrModel" placeholder="Default: {config.OCR_MODEL}" />
-          </div>
-        </div>
-
-        <div class="row2">
-          <div>
-            <label>Stage 2 Classifier Provider (optional override)</label>
-            <select id="classifierProvider">
-              <option value="">Default ({config.CLASSIFIER_PROVIDER})</option>
-              <option value="openai">openai</option>
-              <option value="gemini">gemini</option>
-              <option value="deepseek">deepseek</option>
-              <option value="openrouter">openrouter</option>
-            </select>
-          </div>
-          <div>
-            <label>Stage 2 Classifier Model (optional override)</label>
-            <input type="text" id="classifierModel" placeholder="Default: {config.CLASSIFIER_MODEL}" />
-          </div>
-        </div>
-
-        <label>Item Subcategories (comma-separated)</label>
+        <label>Allowed Subcategories for this User (comma-separated)</label>
+        <div class="sub" style="font-size: 0.78rem; margin-bottom: 4px;">Items on receipts will be strictly categorized into one of these subcategories during Stage 2 classification.</div>
         <input type="text" id="subcategories" value="{default_subcats}" />
 
-        <div class="actions" style="margin-top: 14px;">
+        <div class="actions" style="margin-top: 16px;">
           <button onclick="saveBot()">💾 Save &amp; Start Bot</button>
           <button class="secondary" onclick="resetForm()">Clear Form</button>
         </div>
@@ -245,8 +247,8 @@ def render_dashboard_html() -> str:
 
       <!-- Right: Live 2-Stage OCR Tester -->
       <div class="card">
-        <h2>🧪 Test 2-Stage Receipt OCR</h2>
-        <div class="sub">Upload a receipt image to test Stage 1 (OCR) &rarr; Stage 2 (Classifier) directly in the browser.</div>
+        <h2>🧪 Test Receipt OCR</h2>
+        <div class="sub">Upload a receipt photo to test OCR &rarr; Item Classification directly in the browser.</div>
 
         <label>API Key (select a user below or paste key)</label>
         <input type="text" id="testApiKey" placeholder="ocr_live_..." />
@@ -265,11 +267,74 @@ def render_dashboard_html() -> str:
       </div>
     </div>
 
+    <!-- Middle: Final JSON Structure & Webhook Documentation -->
+    <div class="card">
+      <h2>📑 Final Output JSON Schema (Webhook &amp; API)</h2>
+      <div class="sub" style="margin-bottom: 12px;">
+        This is the exact JSON structure sent via HTTP <code>POST</code> to your <b>Destination Webhook URL</b> (and returned by <code>POST /api/ocr</code>). Use this format to design your database tables or webhook handler:
+      </div>
+      <div class="grid" style="margin-bottom: 0;">
+        <div>
+          <pre><code>{{
+  "store_name": "Jumbo",
+  "transaction_date": "2026-10-22",
+  "total_amount": 6.45,
+  "currency": "EUR",
+  "items": [
+    {{
+      "name": "AH HAVERMOUT",
+      "clean_name": "rolled oats",
+      "subcategory": "grains",
+      "quantity": 1.0,
+      "unit_price": 0.75,
+      "total_price": 0.75
+    }},
+    {{
+      "name": "PLAK JONG GVP",
+      "clean_name": "yellow cheese",
+      "subcategory": "dairy",
+      "quantity": 2.0,
+      "unit_price": 3.00,
+      "total_price": 6.00
+    }},
+    {{
+      "name": "BONUS AH JONG",
+      "clean_name": "Discount",
+      "subcategory": null,
+      "quantity": 1.0,
+      "unit_price": -0.30,
+      "total_price": -0.30
+    }}
+  ]
+}}</code></pre>
+        </div>
+        <div>
+          <table class="schema-table">
+            <thead>
+              <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>store_name</code></td><td>string</td><td>Normalized merchant/store name (e.g. "Lidl", "Jumbo").</td></tr>
+              <tr><td><code>transaction_date</code></td><td>string</td><td>Date of purchase strictly formatted as <code>YYYY-MM-DD</code>.</td></tr>
+              <tr><td><code>total_amount</code></td><td>float</td><td>Final total amount paid on the receipt.</td></tr>
+              <tr><td><code>currency</code></td><td>string</td><td>Three-letter currency code (e.g. "EUR", "PLN", "USD").</td></tr>
+              <tr><td><code>items[].name</code></td><td>string</td><td>Exact original printed item text from the receipt.</td></tr>
+              <tr><td><code>items[].clean_name</code></td><td>string</td><td>Human-readable generic product name normalized by Stage 2.</td></tr>
+              <tr><td><code>items[].subcategory</code></td><td>string | null</td><td>Chosen strictly from the user's allowed subcategories (or null for discounts).</td></tr>
+              <tr><td><code>items[].quantity</code></td><td>float</td><td>Quantity or weight (default 1.0).</td></tr>
+              <tr><td><code>items[].unit_price</code></td><td>float</td><td>Unit price (negative for discounts/rebates).</td></tr>
+              <tr><td><code>items[].total_price</code></td><td>float</td><td>Total line price after quantity (negative for discounts).</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- Bottom: Registered Bots & API Keys -->
     <div class="card">
       <h2>🤖 Registered Telegram Bots &amp; API Endpoints</h2>
       <div class="sub" style="margin-bottom: 12px;">
-        Simple API usage for friends: <code>curl -X POST http://&lt;HOST&gt;:8080/api/ocr -H "X-API-Key: &lt;API_KEY&gt;" -F "file=@receipt.jpg"</code>
+        Direct API usage: <code>curl -X POST http://&lt;HOST&gt;:8080/api/ocr -H "X-API-Key: &lt;API_KEY&gt;" -F "file=@receipt.jpg"</code>
       </div>
       <div id="botsList">Loading...</div>
     </div>
@@ -309,7 +374,7 @@ def render_dashboard_html() -> str:
           <div class="sub" style="margin-top: 8px;">
             <div>🔑 API Key: <code>${{b.api_key}}</code></div>
             <div>🌐 Destination Webhook: <code>${{b.webhook_url || 'Not configured'}}</code></div>
-            <div>🧠 Stage 1 OCR: <code>${{b.ocr_provider}} / ${{b.ocr_model}}</code> &rarr; Stage 2 Classifier: <code>${{b.classifier_provider}} / ${{b.classifier_model}}</code></div>
+            <div>🌐 Clean Name Language: <code>${{b.language || 'en'}}</code> | 🏷️ Allowed Subcategories (${{(b.subcategories || []).length}}): <code>${{(b.subcategories || []).join(', ')}}</code></div>
           </div>
         </div>
       `).join('');
@@ -326,14 +391,11 @@ def render_dashboard_html() -> str:
       document.getElementById('editBotId').value = b.id;
       document.getElementById('botName').value = b.name;
       document.getElementById('botCurrency').value = b.default_currency || 'EUR';
+      document.getElementById('botLanguage').value = b.language || 'en';
       document.getElementById('botToken').value = '';
       document.getElementById('botToken').placeholder = b.has_telegram_bot ? '(Leave empty to keep existing bot token)' : 'Paste @BotFather token';
       document.getElementById('webhookUrl').value = b.webhook_url || '';
       document.getElementById('webhookSecret').value = '';
-      document.getElementById('ocrProvider').value = b.raw_ocr_provider || '';
-      document.getElementById('ocrModel').value = b.raw_ocr_model || '';
-      document.getElementById('classifierProvider').value = b.raw_classifier_provider || '';
-      document.getElementById('classifierModel').value = b.raw_classifier_model || '';
       document.getElementById('subcategories').value = (b.subcategories || []).join(', ');
       window.scrollTo({{ top: 0, behavior: 'smooth' }});
     }}
@@ -343,14 +405,11 @@ def render_dashboard_html() -> str:
       document.getElementById('editBotId').value = '';
       document.getElementById('botName').value = '';
       document.getElementById('botCurrency').value = 'EUR';
+      document.getElementById('botLanguage').value = 'en';
       document.getElementById('botToken').value = '';
       document.getElementById('botToken').placeholder = '123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ';
       document.getElementById('webhookUrl').value = '';
       document.getElementById('webhookSecret').value = '';
-      document.getElementById('ocrProvider').value = '';
-      document.getElementById('ocrModel').value = '';
-      document.getElementById('classifierProvider').value = '';
-      document.getElementById('classifierModel').value = '';
       document.getElementById('subcategories').value = '{default_subcats}';
       document.getElementById('formStatus').innerText = '';
     }}
@@ -363,11 +422,8 @@ def render_dashboard_html() -> str:
       const payload = {{
         name: document.getElementById('botName').value.trim(),
         default_currency: document.getElementById('botCurrency').value.trim() || 'EUR',
+        language: document.getElementById('botLanguage').value || 'en',
         webhook_url: document.getElementById('webhookUrl').value.trim() || null,
-        ocr_provider: document.getElementById('ocrProvider').value || null,
-        ocr_model: document.getElementById('ocrModel').value.trim() || null,
-        classifier_provider: document.getElementById('classifierProvider').value || null,
-        classifier_model: document.getElementById('classifierModel').value.trim() || null,
         subcategories: subcats.length ? subcats : null,
       }};
 

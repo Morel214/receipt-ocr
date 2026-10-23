@@ -68,16 +68,27 @@ def build_stage_2_classifier_prompt(
     """Build the prompt for Stage 2 (Text LLM filling in clean_name and subcategory)."""
     allowed_subcats = subcategories or config.DEFAULT_SUBCATEGORIES
     subcats_formatted = ", ".join(f'"{s}"' for s in allowed_subcats)
-    lang_desc = "English" if language.lower() == "en" else f"'{language}'"
+    lang_map = {
+        "en": "English",
+        "pl": "Polish",
+        "nl": "Dutch",
+        "de": "German",
+        "es": "Spanish",
+        "fr": "French",
+        "it": "Italian",
+    }
+    lang_desc = lang_map.get(language.lower(), language)
 
     return (
         "You are a receipt product normalizer and classifier.\n"
         "You will receive a JSON object extracted from a receipt where each item in `items` has an empty `clean_name` and `subcategory`.\n"
         "Return ONLY pure JSON code (without any introductory text, explanations, or Markdown formatting tags such as ```json) "
         "with the exact same structure and numeric values, filling in `clean_name` and `subcategory` for every item:\n"
-        f"1. `clean_name`: Concise, human-readable generic product name in {lang_desc} (lowercase, e.g. 'yellow cheese', 'eggs', 'rolled oats', 'chicken breast'). "
-        "For bottle deposits ('STATIEGELD' / 'KAUCJA') use 'deposit'. "
-        "For discount/rebate lines (negative prices, 'ACTIE', 'BONUS', 'RABAT', 'KIES&MIX') use 'Discount'.\n"
+        f"1. `clean_name`: Concise, human-readable generic product name in {lang_desc} (lowercase, e.g. "
+        "if English: 'yellow cheese', 'eggs', 'rolled oats', 'chicken breast'; "
+        "if Polish: 'ser żółty', 'jajka', 'płatki owsiane', 'pierś z kurczaka'). "
+        "For bottle deposits ('STATIEGELD' / 'KAUCJA') use 'deposit' (or 'kaucja' if Polish). "
+        "For discount/rebate lines (negative prices, 'ACTIE', 'BONUS', 'RABAT', 'KIES&MIX') use 'Discount' (or 'Rabat' if Polish).\n"
         f"2. `subcategory`: Choose strictly ONE from [{subcats_formatted}], or `null` if the line is a discount.\n"
         "Do not modify `store_name`, `transaction_date`, `total_amount`, `currency`, `name`, `quantity`, `unit_price`, or `total_price`."
     )
