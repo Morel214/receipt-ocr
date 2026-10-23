@@ -40,11 +40,13 @@ def create_tenant(
     allowed_chat_ids: list[int] | None = None,
     webhook_url: str | None = None,
     webhook_secret: str | None = None,
-    default_currency: str = "PLN",
-    language: str = "pl",
+    default_currency: str = "EUR",
+    language: str = "en",
     subcategories: list[str] | None = None,
     ocr_provider: str | None = None,
     ocr_model: str | None = None,
+    classifier_provider: str | None = None,
+    classifier_model: str | None = None,
     api_key: str | None = None,
     database_path: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -54,7 +56,11 @@ def create_tenant(
     subcats_json = (
         json.dumps(subcategories, ensure_ascii=False) if subcategories is not None else None
     )
-    clean_token = telegram_bot_token.strip() if telegram_bot_token and telegram_bot_token.strip() else None
+    clean_token = (
+        telegram_bot_token.strip()
+        if telegram_bot_token and telegram_bot_token.strip()
+        else None
+    )
 
     with get_connection(database_path) as conn:
         cursor = conn.cursor()
@@ -63,9 +69,10 @@ def create_tenant(
             INSERT INTO tenants (
                 name, api_key, telegram_bot_token, allowed_chat_ids,
                 webhook_url, webhook_secret, default_currency, language,
-                subcategories_json, ocr_provider, ocr_model, is_active
+                subcategories_json, ocr_provider, ocr_model,
+                classifier_provider, classifier_model, is_active
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
             """,
             (
                 name.strip(),
@@ -79,6 +86,8 @@ def create_tenant(
                 subcats_json,
                 ocr_provider.strip().lower() if ocr_provider else None,
                 ocr_model.strip() if ocr_model else None,
+                classifier_provider.strip().lower() if classifier_provider else None,
+                classifier_model.strip() if classifier_model else None,
             ),
         )
         tenant_id = int(cursor.lastrowid)
@@ -166,6 +175,8 @@ def update_tenant(
         "subcategories_json",
         "ocr_provider",
         "ocr_model",
+        "classifier_provider",
+        "classifier_model",
         "is_active",
     }
     updates: list[str] = []
@@ -179,6 +190,10 @@ def update_tenant(
 
     if "allowed_chat_ids" in fields and isinstance(fields["allowed_chat_ids"], list):
         fields["allowed_chat_ids"] = ",".join(str(x) for x in fields["allowed_chat_ids"])
+
+    if "telegram_bot_token" in fields and fields["telegram_bot_token"] is not None:
+        tok = str(fields["telegram_bot_token"]).strip()
+        fields["telegram_bot_token"] = tok if tok else None
 
     if "is_active" in fields and isinstance(fields["is_active"], bool):
         fields["is_active"] = 1 if fields["is_active"] else 0

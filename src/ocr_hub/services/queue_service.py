@@ -78,7 +78,7 @@ def ocr_one_job(
     job: dict[str, Any],
     database_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run Cloud OCR + classification on a single job and update its queue status."""
+    """Run the 2-stage OCR + Classification pipeline on a single job and update its queue status."""
     job_id = job["id"]
     tenant_id = job["tenant_id"]
     tenant = tenants_repo.get_tenant_by_id(tenant_id, database_path=database_path)
@@ -89,7 +89,7 @@ def ocr_one_job(
     content_type = _content_type_for(job["image_path"])
 
     logger.info(
-        "[ocr_one_job] Running Cloud OCR for tenant=%s job=%s",
+        "[ocr_one_job] Running 2-stage OCR pipeline for tenant=%s job=%s",
         tenant["name"],
         job_id,
     )
@@ -99,9 +99,11 @@ def ocr_one_job(
             content_type=content_type,
             provider=tenant.get("ocr_provider"),
             model=tenant.get("ocr_model"),
+            classifier_provider=tenant.get("classifier_provider"),
+            classifier_model=tenant.get("classifier_model"),
             subcategories=tenant.get("subcategories"),
-            default_currency=tenant.get("default_currency", "PLN"),
-            language=tenant.get("language", "pl"),
+            default_currency=tenant.get("default_currency", "EUR"),
+            language=tenant.get("language", "en"),
         )
     except Exception as exc:
         logger.error("[ocr_one_job] Job %s OCR failed: %s", job_id, exc)
@@ -114,7 +116,6 @@ def ocr_one_job(
     result_dict["store_name"] = normalize_store_name(result_dict.get("store_name"))
     jobs_repo.update_job_ocr(job_id, result_dict, database_path=database_path)
 
-    # Check effective confidence (minimum of item confidences and top-level confidence)
     item_confidences = [
         item.get("confidence")
         for item in result_dict.get("items", [])
@@ -196,13 +197,13 @@ def confirm_job(
     """
     job = jobs_repo.get_job(job_id, tenant_id=tenant_id, database_path=database_path)
     if job is None:
-        raise ValueError(f"Paragon #{job_id} nie istnieje.")
+        raise ValueError(f"Receipt job #{job_id} not found.")
     if not job.get("ocr_json"):
-        raise ValueError(f"Paragon #{job_id} nie posiada jeszcze wyniku OCR.")
+        raise ValueError(f"Receipt job #{job_id} has no OCR result yet.")
 
     tenant = tenants_repo.get_tenant_by_id(tenant_id, database_path=database_path)
     if tenant is None:
-        raise ValueError(f"Nie znaleziono użytkownika (tenant_id={tenant_id}).")
+        raise ValueError(f"Tenant not found (tenant_id={tenant_id}).")
 
     result = validate_ocr_result(json.loads(job["ocr_json"]))
     store_name = normalize_store_name(result.store_name)
@@ -219,8 +220,8 @@ def confirm_job(
     )
     if existing_id is not None:
         raise ValueError(
-            f"Paragon #{job_id} to duplikat już potwierdzonego paragonu #{existing_id} "
-            f"({store_name} / {txn_date} / {total_amount:.2f}). Użyj /reject {job_id}."
+            f"Receipt #{job_id} is a duplicate of already confirmed receipt #{existing_id} "
+            f"({store_name} / {txn_date} / {total_amount:.2f}). Use /reject {job_id}."
         )
 
     try:

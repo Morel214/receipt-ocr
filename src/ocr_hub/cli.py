@@ -10,7 +10,7 @@ from ocr_hub.repositories import tenants_repo
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
-    """Start the FastAPI gateway + Telegram Multi-Bot Manager."""
+    """Start the FastAPI gateway + Web Dashboard + Telegram Multi-Bot Manager."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -31,7 +31,7 @@ def cmd_init_db(_args: argparse.Namespace) -> None:
 
 
 def cmd_add_tenant(args: argparse.Namespace) -> None:
-    """Register a new user/friend and print their generated API key."""
+    """Register a new user/bot and print their generated API key."""
     init_db()
     chat_ids = [
         int(x.strip())
@@ -46,10 +46,10 @@ def cmd_add_tenant(args: argparse.Namespace) -> None:
         webhook_secret=args.webhook_secret,
         default_currency=args.currency,
     )
-    print(f"✅ Created tenant '{tenant['name']}' (id={tenant['id']})")
+    print(f"✅ Created bot/user '{tenant['name']}' (id={tenant['id']})")
     print(f"🔑 API Key:      {tenant['api_key']}")
     print(f"🤖 Bot Token:    {'configured' if tenant.get('telegram_bot_token') else 'none'}")
-    print(f"🌐 Webhook URL:  {tenant.get('webhook_url') or 'not set (user can set via /set_webhook)'}")
+    print(f"🌐 Webhook URL:  {tenant.get('webhook_url') or 'not set'}")
 
 
 def cmd_list_tenants(_args: argparse.Namespace) -> None:
@@ -57,7 +57,7 @@ def cmd_list_tenants(_args: argparse.Namespace) -> None:
     init_db()
     tenants = tenants_repo.list_tenants()
     if not tenants:
-        print("No tenants registered yet. Use 'ocr-hub add-tenant --name ...' to add one.")
+        print("No bots/users registered yet. Open http://localhost:8080/ or use 'ocr-hub add-tenant'.")
         return
     for t in tenants:
         bot_flag = "🤖 Bot configured" if t.get("telegram_bot_token") else "🔌 API only"
@@ -71,11 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="ocr-hub",
-        description="Receipt OCR Hub — Multi-tenant OCR API & Telegram Bot Manager",
+        description="Receipt OCR Hub — Two-Stage OCR API, Web Dashboard & Telegram Bot Manager",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve_p = sub.add_parser("serve", help="Run the FastAPI server and Telegram BotManager")
+    serve_p = sub.add_parser("serve", help="Run the FastAPI server, Web Dashboard, and Telegram BotManager")
     serve_p.add_argument("--host", default=None, help="Bind host (default from .env)")
     serve_p.add_argument("--port", type=int, default=None, help="Bind port (default from .env)")
     serve_p.add_argument("--reload", action="store_true", help="Enable auto-reload for dev")
@@ -84,13 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     init_p = sub.add_parser("init-db", help="Initialize the SQLite database")
     init_p.set_defaults(func=cmd_init_db)
 
-    add_p = sub.add_parser("add-tenant", help="Add a new user/friend and generate their API key")
-    add_p.add_argument("--name", required=True, help="Unique name of the user/friend")
+    add_p = sub.add_parser("add-tenant", help="Add a new user/bot and generate their API key")
+    add_p.add_argument("--name", required=True, help="Unique name of the user/bot")
     add_p.add_argument("--bot-token", default=None, help="Telegram bot token from @BotFather")
     add_p.add_argument("--chat-ids", default="", help="Comma-separated allowed Telegram chat IDs")
-    add_p.add_argument("--webhook-url", default=None, help="Destination webhook URL for results")
+    add_p.add_argument("--webhook-url", default=None, help="Destination webhook URL for JSON results")
     add_p.add_argument("--webhook-secret", default=None, help="Bearer secret for the webhook")
-    add_p.add_argument("--currency", default="PLN", help="Default currency (PLN, EUR, USD)")
+    add_p.add_argument("--currency", default="EUR", help="Default currency (EUR, PLN, USD)")
     add_p.set_defaults(func=cmd_add_tenant)
 
     list_p = sub.add_parser("list-tenants", help="List all registered users and their API keys")

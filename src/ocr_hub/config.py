@@ -1,4 +1,9 @@
-"""Centralized configuration and environment settings for Receipt OCR Hub."""
+"""Centralized configuration and environment settings for Receipt OCR Hub.
+
+Allows independent selection of:
+1. Stage 1 Vision OCR Model (OCR_PROVIDER, OCR_MODEL)
+2. Stage 2 Text Classifier Model (CLASSIFIER_PROVIDER, CLASSIFIER_MODEL)
+"""
 
 import os
 from pathlib import Path
@@ -18,32 +23,44 @@ DB_PATH = Path(os.getenv("DB_PATH", str(DEFAULT_DB_PATH)))
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", str(DATA_DIR / "uploads")))
 RECEIPTS_UPLOAD_DIR = UPLOADS_DIR / "receipts"
 
-# Admin authentication
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-admin-master-secret")
+# Optional Admin key (if empty, Web UI management endpoints do not require a header on private networks)
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# Cloud OCR & Classification LLM configuration
+# ==============================================================================
+# STAGE 1: Vision OCR Model Configuration (Image -> Raw Receipt JSON)
+# ==============================================================================
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "openai").strip().lower()
 OCR_MODEL = os.getenv("OCR_MODEL", "gpt-4o-mini").strip()
+
+# ==============================================================================
+# STAGE 2: Text Classifier Model Configuration (Raw JSON -> clean_name + subcategory)
+# ==============================================================================
+CLASSIFIER_PROVIDER = os.getenv("CLASSIFIER_PROVIDER", OCR_PROVIDER).strip().lower()
+CLASSIFIER_MODEL = os.getenv("CLASSIFIER_MODEL", OCR_MODEL).strip()
+
+# ==============================================================================
+# Provider API Keys & Endpoints
+# ==============================================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").strip().rstrip("/")
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "120"))
 
-# Default Biometer subcategories (used unless a tenant overrides them)
+# Default subcategories for Stage 2 classification
+_raw_subcats = os.getenv(
+    "DEFAULT_SUBCATEGORIES",
+    "dairy,meat,vegetables,fruits,bakery,grains,pasta,canned_jarred,ready_meals,snacks,beverages,household,other",
+)
 DEFAULT_SUBCATEGORIES: list[str] = [
-    "nabiał",
-    "mięso i wędliny",
-    "warzywa",
-    "owoce",
-    "pieczywo",
-    "produkty zbożowe",
-    "makaron",
-    "przetwory i słoiki",
-    "gotowy posiłek",
-    "przekąski",
-    "napoje",
-    "artykuły domowe/inne",
-    "inne",
+    s.strip() for s in _raw_subcats.split(",") if s.strip()
 ]
 
 # Queue & Telegram polling settings

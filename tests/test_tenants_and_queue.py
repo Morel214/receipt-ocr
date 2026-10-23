@@ -16,14 +16,13 @@ def _fake_ocr_result(store: str = "Biedronka", total: float = 42.50) -> ReceiptO
         store_name=store,
         transaction_date="2026-10-22",
         total_amount=total,
-        currency="PLN",
+        currency="EUR",
         confidence=0.95,
         items=[
             ReceiptItem(
                 name="SER GOUDA",
-                clean_name="ser gouda",
-                category="FOOD",
-                subcategory="nabiał",
+                clean_name="gouda cheese",
+                subcategory="dairy",
                 quantity=1.0,
                 unit_price=total,
                 total_price=total,
@@ -70,7 +69,7 @@ def test_multi_tenant_queue_and_webhook_delivery(
 
     # Tenant B must NOT see or be able to confirm Tenant A's job
     assert jobs_repo.list_open_jobs(tenant_id=tenant_b["id"]) == []
-    with pytest.raises(ValueError, match="nie istnieje"):
+    with pytest.raises(ValueError, match="not found"):
         queue_service.confirm_job(tenant_id=tenant_b["id"], job_id=job_a_id)
 
     # Confirm as Tenant A -> should POST to Tenant A's webhook with Bearer secret-a
@@ -93,7 +92,7 @@ def test_multi_tenant_queue_and_webhook_delivery(
     assert captured_requests[0]["url"] == "https://user-a.example.com/webhook"
     assert captured_requests[0]["headers"]["Authorization"] == "Bearer secret-a"
     assert captured_requests[0]["json"]["store_name"] == "Lidl"
-    assert captured_requests[0]["json"]["items"][0]["clean_name"] == "ser gouda"
+    assert captured_requests[0]["json"]["items"][0]["clean_name"] == "gouda cheese"
 
 
 def test_webhook_failure_marks_job_delivery_failed_and_allows_retry(

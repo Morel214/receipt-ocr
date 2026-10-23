@@ -1,8 +1,10 @@
-"""Cloud Vision OCR & Product Classification Engine (OpenAI / OpenRouter / Gemini).
+"""Two-Stage Receipt OCR & Product Classification Engine.
 
-Replaces the legacy n8n workflow with direct, structured cloud VLM calls that
-simultaneously extract receipt headers, line items, clean product names, and
-categories/subcategories.
+Stage 1 (Vision Model - OCR_PROVIDER / OCR_MODEL):
+    Reads the receipt image and extracts raw JSON with empty ``clean_name`` and ``subcategory``.
+
+Stage 2 (Text Classifier Model - CLASSIFIER_PROVIDER / CLASSIFIER_MODEL):
+    Receives the JSON from Stage 1 and populates ``clean_name`` and ``subcategory`` for each item.
 """
 
 import base64
@@ -20,6 +22,65 @@ from ocr_hub import config
 from ocr_hub.db.models import ReceiptOCRResult
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# STAGE 1 PROMPT: Pure OCR Extraction (clean_name and subcategory left empty)
+# ==============================================================================
+STAGE_1_OCR_PROMPT = """Read all data from this receipt and return ONLY pure JSON code (without any introductory text, explanations, or Markdown formatting tags such as ```json).
+
+Data analysis rules:
+1. "store_name": Store/chain name (e.g. "Jumbo", "Lidl", "Biedronka").
+2. "transaction_date": Purchase date extracted from the receipt strictly in YYYY-MM-DD format.
+3. "total_amount": Final total amount to pay (float).
+4. "currency": Three-letter currency code extracted from the receipt (e.g. "EUR", "PLN"). If missing, infer from the country/store.
+5. "items" list (receipt line items):
+   - "name": Exact original item name from the receipt.
+   - "clean_name": empty
+   - "subcategory": empty
+   - "quantity": Product quantity or weight (float, default 1.0).
+   - "unit_price": Price per unit/piece (float).
+   - "total_price": Total price for the item after quantity or negative discount amount (float).
+
+Required JSON structure:
+{
+  "store_name": "string",
+  "transaction_date": "YYYY-MM-DD",
+  "total_amount": 0.00,
+  "currency": "EUR",
+  "items": [
+    {
+      "name": "string",
+      "clean_name": "",
+      "subcategory": null,
+      "quantity": 1.0,
+      "unit_price": 0.00,
+      "total_price": 0.00
+    }
+  ]
+}"""
+
+
+def build_stage_2_classifier_prompt(
+    subcategories: list[str] | None = None,
+    language: str = "en",
+) -> str:
+    """Build the prompt for Stage 2 (Text LLM filling in clean_name and subcategory)."""
+    allowed_subcats = subcategories or config.DEFAULT_SUBCATEGORIES
+    subcats_formatted = ", ".join(f'"{s}"' for s in allowed_subcats)
+    lang_desc = "English" if language.lower() == "en" else f"'{language}'"
+
+    return (
+        "You are a receipt product normalizer and classifier.\n"
+        "You will receive a JSON object extracted from a receipt where each item in `items` has an empty `clean_name` and `subcategory`.\n"
+        "Return ONLY pure JSON code (without any introductory text, explanations, or Markdown formatting tags such as ```json) "
+        "with the exact same structure and numeric values, filling in `clean_name` and `subcategory` for every item:\n"
+        f"1. `clean_name`: Concise, human-readable generic product name in {lang_desc} (lowercase, e.g. 'yellow cheese', 'eggs', 'rolled oats', 'chicken breast'). "
+        "For bottle deposits ('STATIEGELD' / 'KAUCJA') use 'deposit'. "
+        "For discount/rebate lines (negative prices, 'ACTIE', 'BONUS', 'RABAT', 'KIES&MIX') use 'Discount'.\n"
+        f"2. `subcategory`: Choose strictly ONE from [{subcats_formatted}], or `null` if the line is a discount.\n"
+        "Do not modify `store_name`, `transaction_date`, `total_amount`, `currency`, `name`, `quantity`, `unit_price`, or `total_price`."
+    )
 
 
 def normalize_store_name(name: str | None) -> str:
@@ -64,65 +125,10 @@ def generate_receipt_filename(
 
 
 def validate_ocr_result(data: dict[str, Any]) -> ReceiptOCRResult:
-    """Validate raw OCR dictionary into a ``ReceiptOCRResult`` model."""
+    """Validate a parsed OCR dictionary into a ``ReceiptOCRResult`` model."""
     result = ReceiptOCRResult.model_validate(data)
     result.store_name = normalize_store_name(result.store_name)
     return result
-
-
-def build_ocr_system_prompt(
-    subcategories: list[str] | None = None,
-    default_currency: str = "PLN",
-    language: str = "pl",
-) -> str:
-    """Build the system instruction for receipt extraction and item categorization."""
-    allowed_subcats = subcategories or config.DEFAULT_SUBCATEGORIES
-    subcats_formatted = ", ".join(f'"{s}"' for s in allowed_subcats)
-    lang_label = "Polish (lowercase)" if language.lower() == "pl" else f"'{language}' (lowercase)"
-
-    return (
-        "You are an expert Receipt OCR and Grocery Product Classifier.\n"
-        "Analyze the provided receipt image (which may be in Polish, Dutch, English, German, or another language) "
-        "and return ONLY a valid JSON object matching the exact schema below.\n\n"
-        "### Extraction & Classification Rules:\n"
-        "1. `store_name`: Name of the merchant/supermarket in Title Case (e.g. 'Biedronka', 'Lidl', 'Jumbo', 'Albert Heijn').\n"
-        "2. `transaction_date`: Receipt date in `YYYY-MM-DD` format (or null if unreadable).\n"
-        "3. `total_amount`: Final total amount paid (float, >= 0).\n"
-        f"4. `currency`: 3-letter ISO currency code detected from the receipt (e.g. 'PLN', 'EUR', 'USD'). Default to '{default_currency}' if not shown.\n"
-        "5. `confidence`: Overall OCR reading confidence between 0.0 and 1.0.\n"
-        "6. `items`: Array of line items purchased. For EVERY item on the receipt:\n"
-        "   - `name`: Exact raw item text as printed on the receipt (e.g. 'PLAK JONG GVP', 'SCHARREL M/L 12ST').\n"
-        f"   - `clean_name`: Simplified, human-readable generic product name in {lang_label} "
-        "(e.g. 'ser żółty', 'jajka', 'płatki owsiane', 'filet z kurczaka'). "
-        "For bottle deposits ('STATIEGELD' / 'KAUCJA') use 'kaucja'. "
-        "For discount/rebate lines ('RABAT', 'OPUST', 'ACTIE', 'KIES&MIX', 'BONUS') use 'Rabat'.\n"
-        "   - `category`: High-level category ('FOOD', 'HOUSEHOLD', 'HEALTH', 'OTHER').\n"
-        f"   - `subcategory`: Choose strictly ONE from: [{subcats_formatted}], or `null` if the line is a discount ('Rabat').\n"
-        "   - `quantity`: Numeric quantity (float > 0, default 1.0).\n"
-        "   - `unit_price`: Price per single unit (float; use a NEGATIVE number for discounts/promotions).\n"
-        "   - `total_price`: Total price for this line item (float; use a NEGATIVE number for discounts/promotions).\n"
-        "   - `confidence`: Line-level reading confidence between 0.0 and 1.0.\n\n"
-        "### Required JSON Output Structure:\n"
-        "{\n"
-        '  "store_name": "string",\n'
-        '  "transaction_date": "YYYY-MM-DD",\n'
-        '  "total_amount": 0.0,\n'
-        f'  "currency": "{default_currency}",\n'
-        '  "confidence": 0.95,\n'
-        '  "items": [\n'
-        "    {\n"
-        '      "name": "RAW RECEIPT NAME",\n'
-        '      "clean_name": "normalized name",\n'
-        '      "category": "FOOD",\n'
-        '      "subcategory": "one of allowed subcategories or null",\n'
-        '      "quantity": 1.0,\n'
-        '      "unit_price": 0.0,\n'
-        '      "total_price": 0.0,\n'
-        '      "confidence": 0.95\n'
-        "    }\n"
-        "  ]\n"
-        "}"
-    )
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -134,113 +140,221 @@ def _strip_json_fences(raw_text: str) -> str:
     return cleaned.strip()
 
 
-def _call_openai_compatible(
+def _resolve_openai_compatible_credentials(provider: str) -> tuple[str, str]:
+    """Return ``(api_key, base_url)`` for OpenAI, DeepSeek, or OpenRouter."""
+    p = provider.strip().lower()
+    if p == "deepseek":
+        key = config.DEEPSEEK_API_KEY or config.OPENAI_API_KEY
+        if not key:
+            raise RuntimeError("DEEPSEEK_API_KEY is not configured in .env.")
+        return key, config.DEEPSEEK_BASE_URL
+    if p == "openrouter":
+        key = config.OPENROUTER_API_KEY or config.OPENAI_API_KEY
+        if not key:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured in .env.")
+        return key, config.OPENROUTER_BASE_URL
+
+    key = config.OPENAI_API_KEY
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not configured in .env.")
+    return key, config.OPENAI_BASE_URL
+
+
+def _call_vision_model(
     content: bytes,
     content_type: str,
-    system_prompt: str,
+    prompt: str,
+    provider: str,
     model: str,
-    api_key: str | None = None,
-    base_url: str | None = None,
     timeout: int | None = None,
 ) -> dict[str, Any]:
-    """Call OpenAI or any OpenAI-compatible Vision API (OpenRouter, Groq, LiteLLM)."""
-    key = api_key or config.OPENAI_API_KEY
-    if not key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not configured. Set it in .env before running OpenAI OCR."
-        )
-    url = f"{(base_url or config.OPENAI_BASE_URL).rstrip('/')}/chat/completions"
+    """Execute Stage 1 Vision call (OpenAI/OpenRouter or Gemini)."""
     req_timeout = timeout if timeout is not None else config.OCR_TIMEOUT_SECONDS
     b64_image = base64.b64encode(content).decode("ascii")
+    p = provider.strip().lower()
 
-    payload = {
-        "model": model,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Extract and classify all items from this receipt image into the required JSON format.",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{content_type};base64,{b64_image}"},
-                    },
-                ],
+    if p == "gemini":
+        key = config.GEMINI_API_KEY
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY is not configured in .env.")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inlineData": {"mimeType": content_type, "data": b64_image}},
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
             },
-        ],
-    }
+        }
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        logger.info("[Stage 1 OCR - Gemini] POST %s model=%s", url, model)
+        response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+        response.raise_for_status()
+        raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(_strip_json_fences(raw_text))
 
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
+    if p in ("openai", "openrouter", "custom"):
+        key, base_url = _resolve_openai_compatible_credentials(p)
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{content_type};base64,{b64_image}"},
+                        },
+                    ],
+                }
+            ],
+        }
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        logger.info("[Stage 1 OCR - %s] POST %s model=%s", p, url, model)
+        response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+        response.raise_for_status()
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        return json.loads(_strip_json_fences(raw_text))
 
-    logger.info("[_call_openai_compatible] POST %s model=%s (%d bytes)", url, model, len(content))
-    response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
-    response.raise_for_status()
-    resp_json = response.json()
-    raw_content = resp_json["choices"][0]["message"]["content"]
-    return json.loads(_strip_json_fences(raw_content))
+    raise ValueError(
+        f"Unsupported Stage 1 OCR provider '{provider}'. Choose 'openai', 'gemini', or 'openrouter'."
+    )
 
 
-def _call_gemini(
-    content: bytes,
-    content_type: str,
+def _call_text_classifier_model(
+    raw_ocr_data: dict[str, Any],
     system_prompt: str,
+    provider: str,
     model: str,
-    api_key: str | None = None,
     timeout: int | None = None,
 ) -> dict[str, Any]:
-    """Call Google Gemini Vision REST API with structured JSON output."""
-    key = api_key or config.GEMINI_API_KEY
-    if not key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured. Set it in .env before running Gemini OCR."
-        )
+    """Execute Stage 2 Text Classifier call (OpenAI, Gemini, DeepSeek, or OpenRouter)."""
     req_timeout = timeout if timeout is not None else config.OCR_TIMEOUT_SECONDS
-    b64_image = base64.b64encode(content).decode("ascii")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    input_json_str = json.dumps(raw_ocr_data, ensure_ascii=False)
+    p = provider.strip().lower()
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": "Extract and classify all items from this receipt image into the required JSON format."
-                    },
-                    {
-                        "inlineData": {
-                            "mimeType": content_type,
-                            "data": b64_image,
-                        }
-                    },
-                ],
-            }
-        ],
-        "generationConfig": {
+    if p == "gemini":
+        key = config.GEMINI_API_KEY
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY is not configured in .env.")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": input_json_str}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        }
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        logger.info("[Stage 2 Classifier - Gemini] POST %s model=%s", url, model)
+        response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+        response.raise_for_status()
+        raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(_strip_json_fences(raw_text))
+
+    if p in ("openai", "deepseek", "openrouter", "custom"):
+        key, base_url = _resolve_openai_compatible_credentials(p)
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": model,
             "temperature": 0.1,
-            "responseMimeType": "application/json",
-        },
-    }
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": input_json_str},
+            ],
+        }
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        logger.info("[Stage 2 Classifier - %s] POST %s model=%s", p, url, model)
+        response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+        response.raise_for_status()
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        return json.loads(_strip_json_fences(raw_text))
 
-    headers = {
-        "x-goog-api-key": key,
-        "Content-Type": "application/json",
-    }
+    raise ValueError(
+        f"Unsupported Stage 2 Classifier provider '{provider}'. Choose 'openai', 'gemini', 'deepseek', or 'openrouter'."
+    )
 
-    logger.info("[_call_gemini] POST %s model=%s (%d bytes)", url, model, len(content))
-    response = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
-    response.raise_for_status()
-    resp_json = response.json()
-    raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(_strip_json_fences(raw_text))
+
+def extract_raw_receipt_ocr(
+    content: bytes,
+    content_type: str = "image/jpeg",
+    provider: str | None = None,
+    model: str | None = None,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Stage 1: Extract receipt header and raw items with empty ``clean_name`` and ``subcategory``."""
+    chosen_provider = (provider or config.OCR_PROVIDER).strip().lower()
+    chosen_model = (model or config.OCR_MODEL).strip()
+    if chosen_provider == "gemini" and not model and chosen_model.startswith("gpt-"):
+        chosen_model = "gemini-2.5-flash"
+
+    raw_data = _call_vision_model(
+        content=content,
+        content_type=content_type,
+        prompt=STAGE_1_OCR_PROMPT,
+        provider=chosen_provider,
+        model=chosen_model,
+        timeout=timeout,
+    )
+
+    # Guarantee Stage 1 contract: clean_name is "" and subcategory is None before Stage 2
+    for item in raw_data.get("items", []):
+        if isinstance(item, dict):
+            item["clean_name"] = ""
+            item["subcategory"] = None
+
+    return raw_data
+
+
+def classify_receipt_items(
+    raw_ocr_data: dict[str, Any],
+    subcategories: list[str] | None = None,
+    language: str = "en",
+    provider: str | None = None,
+    model: str | None = None,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    """Stage 2: Populate ``clean_name`` and ``subcategory`` on the Stage 1 JSON using the classifier model."""
+    if not raw_ocr_data.get("items"):
+        return raw_ocr_data
+
+    chosen_provider = (provider or config.CLASSIFIER_PROVIDER).strip().lower()
+    chosen_model = (model or config.CLASSIFIER_MODEL).strip()
+    if chosen_provider == "gemini" and not model and chosen_model.startswith("gpt-"):
+        chosen_model = "gemini-2.5-flash"
+    elif chosen_provider == "deepseek" and not model and chosen_model.startswith("gpt-"):
+        chosen_model = "deepseek-chat"
+
+    system_prompt = build_stage_2_classifier_prompt(
+        subcategories=subcategories,
+        language=language,
+    )
+
+    return _call_text_classifier_model(
+        raw_ocr_data=raw_ocr_data,
+        system_prompt=system_prompt,
+        provider=chosen_provider,
+        model=chosen_model,
+        timeout=timeout,
+    )
 
 
 def analyze_receipt_image(
@@ -248,56 +362,35 @@ def analyze_receipt_image(
     content_type: str = "image/jpeg",
     provider: str | None = None,
     model: str | None = None,
+    classifier_provider: str | None = None,
+    classifier_model: str | None = None,
     subcategories: list[str] | None = None,
-    default_currency: str = "PLN",
-    language: str = "pl",
+    default_currency: str = "EUR",
+    language: str = "en",
     timeout: int | None = None,
 ) -> ReceiptOCRResult:
-    """Run Cloud Vision OCR + item classification on a receipt image and validate the result.
-
-    Args:
-        content: Raw image bytes (JPEG/PNG).
-        content_type: Image MIME type.
-        provider: Cloud provider ('openai' or 'gemini'). Defaults to ``config.OCR_PROVIDER``.
-        model: Model identifier override (e.g. 'gpt-4o-mini', 'gemini-2.5-flash').
-        subcategories: Optional custom list of allowed item subcategories.
-        default_currency: Default currency code if not printed on the receipt.
-        language: Language code for ``clean_name`` normalization (default 'pl').
-        timeout: Request timeout in seconds.
-
-    Returns:
-        Validated ``ReceiptOCRResult`` instance.
-    """
-    chosen_provider = (provider or config.OCR_PROVIDER).strip().lower()
-    chosen_model = (model or config.OCR_MODEL).strip()
-    if chosen_provider == "gemini" and not model and chosen_model.startswith("gpt-"):
-        chosen_model = "gemini-2.5-flash"
-
-    system_prompt = build_ocr_system_prompt(
-        subcategories=subcategories,
-        default_currency=default_currency,
-        language=language,
+    """Run the two-stage pipeline (Stage 1 Vision OCR -> Stage 2 Text Classifier) and validate result."""
+    # Stage 1: Vision OCR
+    stage1_json = extract_raw_receipt_ocr(
+        content=content,
+        content_type=content_type,
+        provider=provider,
+        model=model,
+        timeout=timeout,
     )
+    if not stage1_json.get("currency"):
+        stage1_json["currency"] = default_currency
 
-    if chosen_provider in ("openai", "openrouter", "custom"):
-        raw_data = _call_openai_compatible(
-            content=content,
-            content_type=content_type,
-            system_prompt=system_prompt,
-            model=chosen_model,
-            timeout=timeout,
-        )
-    elif chosen_provider == "gemini":
-        raw_data = _call_gemini(
-            content=content,
-            content_type=content_type,
-            system_prompt=system_prompt,
-            model=chosen_model,
-            timeout=timeout,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported OCR provider '{chosen_provider}'. Choose 'openai' or 'gemini'."
-        )
+    # Stage 2: Text Classification (fills clean_name & subcategory)
+    stage2_json = classify_receipt_items(
+        raw_ocr_data=stage1_json,
+        subcategories=subcategories,
+        language=language,
+        provider=classifier_provider or provider,
+        model=classifier_model,
+        timeout=timeout,
+    )
+    if not stage2_json.get("currency"):
+        stage2_json["currency"] = default_currency
 
-    return validate_ocr_result(raw_data)
+    return validate_ocr_result(stage2_json)

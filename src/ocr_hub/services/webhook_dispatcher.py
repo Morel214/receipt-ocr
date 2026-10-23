@@ -1,4 +1,4 @@
-"""Webhook delivery service for pushing confirmed OCR results to a user's database/API."""
+"""Webhook delivery service for pushing final OCR JSON results to a user's destination URL."""
 
 import logging
 from datetime import datetime, timezone
@@ -16,11 +16,7 @@ def build_webhook_payload(
     result: ReceiptOCRResult,
     job_id: int | None = None,
 ) -> dict[str, Any]:
-    """Build a standardized JSON payload for webhook delivery.
-
-    Contains both flat ``ReceiptOCRResult`` keys (for direct compatibility with
-    endpoints like Biometer) and structured event metadata.
-    """
+    """Build a standardized JSON payload for webhook delivery."""
     receipt_dict = result.model_dump(mode="json")
     txn_date = str(result.transaction_date) if result.transaction_date else None
     payload = WebhookDeliveryPayload(
@@ -31,7 +27,7 @@ def build_webhook_payload(
         store_name=result.store_name,
         transaction_date=txn_date,
         total_amount=float(result.total_amount),
-        currency=result.currency or tenant.get("default_currency", "PLN"),
+        currency=result.currency or tenant.get("default_currency", "EUR"),
         confidence=result.confidence,
         items=receipt_dict.get("items", []),
         receipt=receipt_dict,
@@ -45,20 +41,7 @@ def dispatch_receipt_webhook(
     job_id: int | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """POST the confirmed receipt JSON to the tenant's configured ``webhook_url``.
-
-    Args:
-        tenant: Tenant record dictionary.
-        result: Validated ``ReceiptOCRResult``.
-        job_id: Optional job ID in the queue.
-        timeout: HTTP timeout in seconds.
-
-    Returns:
-        Dict with ``delivered`` (bool), ``status_code`` (int | None), and ``response`` (Any).
-
-    Raises:
-        RuntimeError: If the webhook request fails or returns HTTP >= 400.
-    """
+    """POST the parsed receipt JSON to the tenant's configured ``webhook_url``."""
     webhook_url = (tenant.get("webhook_url") or "").strip()
     if not webhook_url:
         logger.info(
@@ -115,7 +98,7 @@ def send_test_webhook(
         return {
             "ok": False,
             "status_code": None,
-            "detail": "Brak skonfigurowanego webhook_url. Użyj /set_webhook <url> [token].",
+            "detail": "No webhook_url configured for this bot.",
         }
 
     headers: dict[str, str] = {

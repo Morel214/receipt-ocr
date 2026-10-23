@@ -10,7 +10,7 @@ def init_db(database_path: str | Path | None = None) -> None:
     with get_connection(database_path) as conn:
         cursor = conn.cursor()
 
-        # Tenants table: each user/friend with their own Telegram bot token, API key, and webhook target
+        # Tenants table: each user/bot configuration
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS tenants (
@@ -21,17 +21,27 @@ def init_db(database_path: str | Path | None = None) -> None:
                 allowed_chat_ids TEXT DEFAULT '',
                 webhook_url TEXT,
                 webhook_secret TEXT,
-                default_currency TEXT NOT NULL DEFAULT 'PLN',
-                language TEXT NOT NULL DEFAULT 'pl',
+                default_currency TEXT NOT NULL DEFAULT 'EUR',
+                language TEXT NOT NULL DEFAULT 'en',
                 subcategories_json TEXT,
                 ocr_provider TEXT,
                 ocr_model TEXT,
+                classifier_provider TEXT,
+                classifier_model TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+
+        # Idempotent migration for existing databases
+        cursor.execute("PRAGMA table_info(tenants)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "classifier_provider" not in existing_cols:
+            cursor.execute("ALTER TABLE tenants ADD COLUMN classifier_provider TEXT;")
+        if "classifier_model" not in existing_cols:
+            cursor.execute("ALTER TABLE tenants ADD COLUMN classifier_model TEXT;")
 
         # Receipt jobs queue scoped to each tenant
         cursor.execute(

@@ -1,10 +1,9 @@
 """FastAPI application for Receipt OCR Hub.
 
-Combines:
-1. Public/Friend OCR & Classification API (/api/v1/ocr/parse)
-2. Self-service user configuration & webhook testing (/api/v1/me/*)
-3. Queue management endpoints (/api/v1/jobs/*)
-4. Multi-Bot Admin provisioning API (/api/v1/admin/tenants)
+Provides:
+1. Built-in Web UI Dashboard (GET /) for adding Telegram bots, setting destination webhooks, and choosing OCR/Classifier models.
+2. Simple OCR API endpoint (POST /api/ocr and POST /api/v1/ocr/parse) running the 2-stage pipeline (Vision OCR -> Text Classifier).
+3. Bot & Webhook management endpoints (/api/bots/*).
 """
 
 import asyncio
@@ -14,9 +13,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import HTMLResponse
 
 from ocr_hub import config
 from ocr_hub.api.auth import get_current_tenant, verify_admin_key
+from ocr_hub.api.web_ui import render_dashboard_html
 from ocr_hub.bot.bot_manager import bot_manager
 from ocr_hub.db.models import TenantCreateRequest, TenantUpdateConfigRequest
 from ocr_hub.db.schema import init_db
@@ -29,17 +30,23 @@ ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
 
 
 def _serialize_tenant(tenant: dict[str, Any], include_secrets: bool = True) -> dict[str, Any]:
-    """Format a tenant record for API responses."""
+    """Format a tenant record for API & Web UI responses."""
     data = {
         "id": tenant["id"],
         "name": tenant["name"],
         "webhook_url": tenant.get("webhook_url"),
         "has_webhook_secret": bool(tenant.get("webhook_secret")),
-        "default_currency": tenant.get("default_currency", "PLN"),
-        "language": tenant.get("language", "pl"),
+        "default_currency": tenant.get("default_currency", "EUR"),
+        "language": tenant.get("language", "en"),
         "subcategories": tenant.get("subcategories") or config.DEFAULT_SUBCATEGORIES,
         "ocr_provider": tenant.get("ocr_provider") or config.OCR_PROVIDER,
         "ocr_model": tenant.get("ocr_model") or config.OCR_MODEL,
+        "classifier_provider": tenant.get("classifier_provider") or config.CLASSIFIER_PROVIDER,
+        "classifier_model": tenant.get("classifier_model") or config.CLASSIFIER_MODEL,
+        "raw_ocr_provider": tenant.get("ocr_provider"),
+        "raw_ocr_model": tenant.get("ocr_model"),
+        "raw_classifier_provider": tenant.get("classifier_provider"),
+        "raw_classifier_model": tenant.get("classifier_model"),
         "allowed_chat_ids": tenant.get("allowed_chat_ids_list", []),
         "has_telegram_bot": bool(tenant.get("telegram_bot_token")),
         "bot_running": bot_manager.is_running(int(tenant["id"])),
@@ -65,14 +72,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Receipt OCR Hub API",
+    title="Receipt OCR Hub",
     description=(
-        "Multi-tenant Receipt OCR & Product Classification Gateway with dynamic "
-        "Telegram Multi-Bot Manager and Webhook delivery."
+        "Two-Stage Receipt OCR & Product Classification Gateway with Web Dashboard "
+        "and Telegram Multi-Bot Manager."
     ),
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def web_dashboard() -> HTMLResponse:
+    """Serve the built-in English Web UI Dashboard."""
+    return HTMLResponse(content=render_dashboard_html())
 
 
 @app.get("/health", tags=["Health"])
@@ -82,27 +95,26 @@ async def health_check() -> dict[str, Any]:
         "status": "ok",
         "service": "receipt-ocr-hub",
         "active_telegram_bots": len(bot_manager.running_tenant_ids()),
-        "default_provider": config.OCR_PROVIDER,
-        "default_model": config.OCR_MODEL,
+        "default_ocr_provider": config.OCR_PROVIDER,
+        "default_ocr_model": config.OCR_MODEL,
+        "default_classifier_provider": config.CLASSIFIER_PROVIDER,
+        "default_classifier_model": config.CLASSIFIER_MODEL,
     }
 
 
-@app.post("/api/v1/ocr/parse", tags=["OCR"])
-async def parse_receipt_endpoint(
-    file: UploadFile = File(...),
-    provider: str | None = Form(default=None),
-    model: str | None = Form(default=None),
-    currency: str | None = Form(default=None),
-    language: str | None = Form(default=None),
-    subcategories: str | None = Form(default=None),
-    forward_to_webhook: bool = Form(default=False),
-    tenant: dict[str, Any] = Depends(get_current_tenant),
+async def _handle_ocr_parse(
+    file: UploadFile,
+    provider: str | None,
+    model: str | None,
+    classifier_provider: str | None,
+    classifier_model: str | None,
+    currency: str | None,
+    language: str | None,
+    subcategories: str | None,
+    forward_to_webhook: bool,
+    tenant: dict[str, Any],
 ) -> dict[str, Any]:
-    """Upload a receipt image, run Cloud OCR + item classification, and return structured JSON.
-
-    Can be shared with friends using their personal ``API_KEY``. Optionally forwards
-    the parsed receipt to the user's configured ``webhook_url``.
-    """
+    """Shared implementation for /api/ocr and /api/v1/ocr/parse."""
     content_type = file.content_type or "image/jpeg"
     if content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
@@ -130,18 +142,36 @@ async def parse_receipt_endpoint(
             content_type=content_type,
             provider=provider or tenant.get("ocr_provider"),
             model=model or tenant.get("ocr_model"),
+            classifier_provider=classifier_provider or tenant.get("classifier_provider"),
+            classifier_model=classifier_model or tenant.get("classifier_model"),
             subcategories=custom_subcats,
-            default_currency=currency or tenant.get("default_currency", "PLN"),
-            language=language or tenant.get("language", "pl"),
+            default_currency=currency or tenant.get("default_currency", "EUR"),
+            language=language or tenant.get("language", "en"),
         )
     except Exception as exc:
-        logger.exception("[parse_receipt_endpoint] OCR failed for tenant %s", tenant["name"])
+        logger.exception("[_handle_ocr_parse] OCR failed for tenant %s", tenant["name"])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"OCR processing failed: {exc}",
         ) from exc
 
-    response_data = ocr_result.model_dump(mode="json")
+    response_data = {
+        "store_name": ocr_result.store_name,
+        "transaction_date": str(ocr_result.transaction_date) if ocr_result.transaction_date else None,
+        "total_amount": float(ocr_result.total_amount),
+        "currency": ocr_result.currency,
+        "items": [
+            {
+                "name": item.name,
+                "clean_name": item.clean_name,
+                "subcategory": item.subcategory,
+                "quantity": item.quantity,
+                "unit_price": item.unit_price,
+                "total_price": item.total_price,
+            }
+            for item in ocr_result.items
+        ],
+    }
 
     if forward_to_webhook and tenant.get("webhook_url"):
         try:
@@ -158,87 +188,97 @@ async def parse_receipt_endpoint(
     return response_data
 
 
-@app.get("/api/v1/me", tags=["User Self-Service"])
-async def get_my_profile(
+@app.post("/api/ocr", tags=["OCR"])
+async def parse_receipt_simple(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    classifier_provider: str | None = Form(default=None),
+    classifier_model: str | None = Form(default=None),
+    currency: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    subcategories: str | None = Form(default=None),
+    forward_to_webhook: bool = Form(default=False),
     tenant: dict[str, Any] = Depends(get_current_tenant),
 ) -> dict[str, Any]:
-    """Return the authenticated user's profile, webhook settings, and bot status."""
-    return _serialize_tenant(tenant, include_secrets=True)
+    """Primary simplified OCR endpoint: upload receipt image -> Stage 1 OCR -> Stage 2 Classifier -> JSON."""
+    return await _handle_ocr_parse(
+        file=file,
+        provider=provider,
+        model=model,
+        classifier_provider=classifier_provider,
+        classifier_model=classifier_model,
+        currency=currency,
+        language=language,
+        subcategories=subcategories,
+        forward_to_webhook=forward_to_webhook,
+        tenant=tenant,
+    )
 
 
-@app.put("/api/v1/me/config", tags=["User Self-Service"])
-async def update_my_config(
-    payload: TenantUpdateConfigRequest,
+@app.post("/api/v1/ocr/parse", tags=["OCR"], include_in_schema=False)
+async def parse_receipt_v1_alias(
+    file: UploadFile = File(...),
+    provider: str | None = Form(default=None),
+    model: str | None = Form(default=None),
+    classifier_provider: str | None = Form(default=None),
+    classifier_model: str | None = Form(default=None),
+    currency: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    subcategories: str | None = Form(default=None),
+    forward_to_webhook: bool = Form(default=False),
     tenant: dict[str, Any] = Depends(get_current_tenant),
 ) -> dict[str, Any]:
-    """Update the authenticated user's destination webhook, categories, model, or bot token."""
-    update_fields = payload.model_dump(exclude_unset=True)
-    updated = tenants_repo.update_tenant(tenant["id"], **update_fields)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    if "telegram_bot_token" in update_fields or "is_active" in update_fields:
-        await bot_manager.start_bot_for_tenant(updated)
-
-    return _serialize_tenant(updated, include_secrets=True)
-
-
-@app.post("/api/v1/me/test-webhook", tags=["User Self-Service"])
-async def test_my_webhook(
-    tenant: dict[str, Any] = Depends(get_current_tenant),
-) -> dict[str, Any]:
-    """Send a test payload to the authenticated user's configured webhook URL."""
-    return await asyncio.to_thread(webhook_dispatcher.send_test_webhook, tenant)
-
-
-@app.get("/api/v1/jobs", tags=["Receipt Jobs"])
-async def list_my_jobs(
-    job_status: str | None = Query(default=None, alias="status"),
-    tenant: dict[str, Any] = Depends(get_current_tenant),
-) -> list[dict[str, Any]]:
-    """List receipt jobs belonging to the authenticated user."""
-    return jobs_repo.list_jobs(tenant_id=tenant["id"], status=job_status)
-
-
-@app.post("/api/v1/jobs/{job_id}/confirm", tags=["Receipt Jobs"])
-async def confirm_my_job(
-    job_id: int,
-    tenant: dict[str, Any] = Depends(get_current_tenant),
-) -> dict[str, Any]:
-    """Confirm a pending receipt job and push its JSON to the configured webhook."""
-    try:
-        return await asyncio.to_thread(queue_service.confirm_job, tenant["id"], job_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@app.post("/api/v1/jobs/{job_id}/reject", tags=["Receipt Jobs"])
-async def reject_my_job(
-    job_id: int,
-    tenant: dict[str, Any] = Depends(get_current_tenant),
-) -> dict[str, Any]:
-    """Reject and delete a receipt job."""
-    ok = await asyncio.to_thread(queue_service.reject_job, tenant["id"], job_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"Job #{job_id} not found")
-    return {"job_id": job_id, "status": "rejected"}
+    """Backward-compatible alias for /api/ocr."""
+    return await _handle_ocr_parse(
+        file=file,
+        provider=provider,
+        model=model,
+        classifier_provider=classifier_provider,
+        classifier_model=classifier_model,
+        currency=currency,
+        language=language,
+        subcategories=subcategories,
+        forward_to_webhook=forward_to_webhook,
+        tenant=tenant,
+    )
 
 
 # ==============================================================================
-# Admin Endpoints (Protected by ADMIN_API_KEY)
+# Bot & User Management Endpoints (Used by Web UI Dashboard & Admin API)
 # ==============================================================================
 
 
+@app.get(
+    "/api/bots",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Bots & Webhooks"],
+)
+@app.get(
+    "/api/v1/admin/tenants",
+    dependencies=[Depends(verify_admin_key)],
+    include_in_schema=False,
+)
+async def list_bots() -> list[dict[str, Any]]:
+    """List all registered bots/users and their live status."""
+    tenants = tenants_repo.list_tenants()
+    return [_serialize_tenant(t, include_secrets=True) for t in tenants]
+
+
+@app.post(
+    "/api/bots",
+    dependencies=[Depends(verify_admin_key)],
+    status_code=status.HTTP_201_CREATED,
+    tags=["Bots & Webhooks"],
+)
 @app.post(
     "/api/v1/admin/tenants",
     dependencies=[Depends(verify_admin_key)],
     status_code=status.HTTP_201_CREATED,
-    tags=["Admin (Multi-Bot Management)"],
+    include_in_schema=False,
 )
-async def admin_create_tenant(payload: TenantCreateRequest) -> dict[str, Any]:
-    """Register a new user/friend, generate their API key, and start their Telegram bot."""
+async def create_bot(payload: TenantCreateRequest) -> dict[str, Any]:
+    """Register a new user/bot, generate their API key, and start their Telegram bot."""
     try:
         tenant = tenants_repo.create_tenant(
             name=payload.name,
@@ -251,11 +291,13 @@ async def admin_create_tenant(payload: TenantCreateRequest) -> dict[str, Any]:
             subcategories=payload.subcategories,
             ocr_provider=payload.ocr_provider,
             ocr_model=payload.ocr_model,
+            classifier_provider=payload.classifier_provider,
+            classifier_model=payload.classifier_model,
         )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Tenant name or Telegram bot token already registered: {exc}",
+            detail=f"Bot/user name or Telegram bot token already exists: {exc}",
         ) from exc
 
     if tenant.get("telegram_bot_token"):
@@ -264,45 +306,97 @@ async def admin_create_tenant(payload: TenantCreateRequest) -> dict[str, Any]:
     return _serialize_tenant(tenant, include_secrets=True)
 
 
-@app.get(
-    "/api/v1/admin/tenants",
+@app.put(
+    "/api/bots/{bot_id}",
     dependencies=[Depends(verify_admin_key)],
-    tags=["Admin (Multi-Bot Management)"],
+    tags=["Bots & Webhooks"],
 )
-async def admin_list_tenants() -> list[dict[str, Any]]:
-    """List all registered tenants and their Telegram bot status."""
-    tenants = tenants_repo.list_tenants()
-    return [_serialize_tenant(t, include_secrets=True) for t in tenants]
-
-
 @app.patch(
-    "/api/v1/admin/tenants/{tenant_id}",
+    "/api/v1/admin/tenants/{bot_id}",
     dependencies=[Depends(verify_admin_key)],
-    tags=["Admin (Multi-Bot Management)"],
+    include_in_schema=False,
 )
-async def admin_update_tenant(
-    tenant_id: int,
+async def update_bot(
+    bot_id: int,
     payload: TenantUpdateConfigRequest,
 ) -> dict[str, Any]:
-    """Update a tenant's configuration or Telegram bot token and hot-reload their bot."""
+    """Update a bot's destination webhook, models, or Telegram token and hot-reload the bot."""
     update_fields = payload.model_dump(exclude_unset=True)
-    updated = tenants_repo.update_tenant(tenant_id, **update_fields)
+    updated = tenants_repo.update_tenant(bot_id, **update_fields)
     if updated is None:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+        raise HTTPException(status_code=404, detail="Bot/user not found")
 
     await bot_manager.start_bot_for_tenant(updated)
     return _serialize_tenant(updated, include_secrets=True)
 
 
 @app.delete(
-    "/api/v1/admin/tenants/{tenant_id}",
+    "/api/bots/{bot_id}",
     dependencies=[Depends(verify_admin_key)],
-    tags=["Admin (Multi-Bot Management)"],
+    tags=["Bots & Webhooks"],
 )
-async def admin_delete_tenant(tenant_id: int) -> dict[str, Any]:
-    """Stop a tenant's Telegram bot and remove the tenant from the database."""
-    await bot_manager.stop_bot_for_tenant(tenant_id)
-    deleted = tenants_repo.delete_tenant(tenant_id)
+@app.delete(
+    "/api/v1/admin/tenants/{bot_id}",
+    dependencies=[Depends(verify_admin_key)],
+    include_in_schema=False,
+)
+async def delete_bot(bot_id: int) -> dict[str, Any]:
+    """Stop a Telegram bot and remove its configuration from the database."""
+    await bot_manager.stop_bot_for_tenant(bot_id)
+    deleted = tenants_repo.delete_tenant(bot_id)
     if not deleted:
+        raise HTTPException(status_code=404, detail="Bot/user not found")
+    return {"bot_id": bot_id, "deleted": True}
+
+
+@app.post(
+    "/api/bots/{bot_id}/test-webhook",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Bots & Webhooks"],
+)
+async def test_bot_webhook(bot_id: int) -> dict[str, Any]:
+    """Send a test payload to the specified bot's destination webhook URL."""
+    tenant = tenants_repo.get_tenant_by_id(bot_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Bot/user not found")
+    return await asyncio.to_thread(webhook_dispatcher.send_test_webhook, tenant)
+
+
+# ==============================================================================
+# Self-Service & Queue Endpoints (Authenticated by Tenant API Key)
+# ==============================================================================
+
+
+@app.get("/api/v1/me", tags=["User Self-Service"], include_in_schema=False)
+async def get_my_profile(
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> dict[str, Any]:
+    """Return the authenticated user's profile and settings."""
+    return _serialize_tenant(tenant, include_secrets=True)
+
+
+@app.put("/api/v1/me/config", tags=["User Self-Service"], include_in_schema=False)
+async def update_my_config(
+    payload: TenantUpdateConfigRequest,
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> dict[str, Any]:
+    """Update the authenticated user's configuration via their API key."""
+    update_fields = payload.model_dump(exclude_unset=True)
+    updated = tenants_repo.update_tenant(tenant["id"], **update_fields)
+    if updated is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    return {"tenant_id": tenant_id, "deleted": True}
+
+    if "telegram_bot_token" in update_fields or "is_active" in update_fields:
+        await bot_manager.start_bot_for_tenant(updated)
+
+    return _serialize_tenant(updated, include_secrets=True)
+
+
+@app.get("/api/jobs", tags=["Receipt Jobs"])
+@app.get("/api/v1/jobs", include_in_schema=False)
+async def list_my_jobs(
+    job_status: str | None = Query(default=None, alias="status"),
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> list[dict[str, Any]]:
+    """List receipt jobs belonging to the authenticated user."""
+    return jobs_repo.list_jobs(tenant_id=tenant["id"], status=job_status)

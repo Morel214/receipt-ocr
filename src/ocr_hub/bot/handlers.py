@@ -1,4 +1,7 @@
-"""Telegram command and photo handlers for tenant bots."""
+"""Telegram handlers for tenant receipt bots (photo intake and queue confirmation only).
+
+All bot & destination webhook configuration is managed via the Web UI.
+"""
 
 import asyncio
 import json
@@ -14,7 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from ocr_hub import config
 from ocr_hub.repositories import jobs_repo, tenants_repo
-from ocr_hub.services import queue_service, webhook_dispatcher
+from ocr_hub.services import queue_service
 
 logger = logging.getLogger(__name__)
 
@@ -71,42 +74,42 @@ def render_job_summary(job: dict[str, Any]) -> str:
     total = job.get("total_amount")
     total_str = f"{total:.2f}" if isinstance(total, (int, float)) else "?"
     currency = job.get("currency") or ""
-    dup = " [duplikat]" if job.get("is_duplicate") else ""
-    review = " [do weryfikacji]" if job.get("status") == jobs_repo.NEEDS_REVIEW else ""
-    webhook_err = " [błąd wysyłki webhooka]" if job.get("status") == jobs_repo.DELIVERY_FAILED else ""
+    dup = " [duplicate]" if job.get("is_duplicate") else ""
+    review = " [review]" if job.get("status") == jobs_repo.NEEDS_REVIEW else ""
+    webhook_err = " [webhook failed]" if job.get("status") == jobs_repo.DELIVERY_FAILED else ""
     items_count = 0
     if job.get("items_json"):
         try:
             items_count = len(json.loads(job["items_json"]))
         except Exception:
             items_count = 0
-    items_tag = f" ({items_count} poz.)" if items_count else ""
+    items_tag = f" ({items_count} items)" if items_count else ""
     return f"#{job['id']} · {store} · {date} · {total_str} {currency}{items_tag}{dup}{review}{webhook_err}"
 
 
 def render_pending_list(jobs: list[dict[str, Any]], limit: int = 10) -> str:
     """Render a list of open jobs for a Telegram message."""
     if not jobs:
-        return "Brak oczekujących paragonów."
-    lines = ["🧾 Oczekujące paragony (użyj /items <id>, /confirm <id|all> lub /reject <id|all>):"]
+        return "No pending receipts."
+    lines = ["🧾 Pending receipts (use /items <id>, /confirm <id|all> or /reject <id|all>):"]
     for job in jobs[:limit]:
         lines.append(f"• {render_job_summary(job)}")
     if len(jobs) > limit:
-        lines.append(f"… oraz {len(jobs) - limit} więcej.")
+        lines.append(f"… and {len(jobs) - limit} more.")
     return "\n".join(lines)
 
 
 def render_status(tenant_id: int) -> str:
     """Render an overview of queue statuses for a tenant."""
     labels = {
-        jobs_repo.QUEUED: "w kolejce (queued)",
-        jobs_repo.AWAITING_CONFIRMATION: "oczekuje na potwierdzenie",
-        jobs_repo.NEEDS_REVIEW: "niska pewność OCR (review)",
-        jobs_repo.DELIVERY_FAILED: "błąd dostarczenia webhooka",
-        jobs_repo.CONFIRMED: "potwierdzone i wysłane",
-        jobs_repo.FAILED: "błąd OCR",
+        jobs_repo.QUEUED: "queued",
+        jobs_repo.AWAITING_CONFIRMATION: "awaiting confirmation",
+        jobs_repo.NEEDS_REVIEW: "needs review",
+        jobs_repo.DELIVERY_FAILED: "webhook delivery failed",
+        jobs_repo.CONFIRMED: "confirmed & sent",
+        jobs_repo.FAILED: "failed",
     }
-    lines = ["📊 Status kolejki paragonów:"]
+    lines = ["📊 Queue status:"]
     for status, label in labels.items():
         count = jobs_repo.count_by_status(tenant_id=tenant_id, status=status)
         lines.append(f"• {label}: {count}")
@@ -118,7 +121,7 @@ def parse_job_selector(arg: str) -> tuple[str, int | None]:
     if not arg:
         return ("none", None)
     stripped = arg.strip().lower()
-    if stripped in ("all", "batch", "wszystkie"):
+    if stripped in ("all", "batch"):
         return ("all", None)
     try:
         return ("single", int(stripped.lstrip("#")))
@@ -160,7 +163,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _schedule_batch_processing(tenant_id, chat_id, batch_id, context)
     except Exception:
         logger.exception("[handle_photo] Failed to queue photo for tenant %s", tenant["name"])
-        await update.message.reply_text("❌ Wystąpił błąd podczas zapisywania zdjęcia.")
+        await update.message.reply_text("❌ Failed to process incoming photo.")
 
 
 def _schedule_batch_processing(
@@ -192,7 +195,7 @@ def _schedule_batch_processing(
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Wystąpił błąd podczas przetwarzania paragonu przez OCR.",
+                    text="❌ An error occurred while processing the receipt with OCR.",
                 )
             except Exception:
                 pass
@@ -220,63 +223,50 @@ async def process_batch_and_notify(
     if not processed:
         if failed_jobs:
             details = "; ".join(
-                f"#{j['id']} ({j.get('last_error') or 'błąd'})" for j in failed_jobs
+                f"#{j['id']} ({j.get('last_error') or 'error'})" for j in failed_jobs
             )
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ Nie udało się odczytać paragonów: {details}",
+                text=f"⚠️ Failed to parse receipts: {details}",
             )
             return
         await context.bot.send_message(
             chat_id=chat_id,
-            text="ℹ️ Brak nowych paragonów do przetworzenia w tej partii.",
+            text="ℹ️ No new receipts found to process in this batch.",
         )
         return
 
     text = render_pending_list(processed)
     if failed_jobs:
-        text += "\n\n⚠️ Nie udało się odczytać: " + ", ".join(
+        text += "\n\n⚠️ Failed to read: " + ", ".join(
             f"#{job['id']}" for job in failed_jobs
         )
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 HELP_TEXT = (
-    "🤖 <b>Receipt OCR Hub — Twój Osobisty Bot Paragonowy</b>\n\n"
-    "📸 <b>Jak używać?</b>\n"
-    "Wyślij jedno lub więcej zdjęć paragonów. Bot odczyta produkty, wyczyści ich nazwy, "
-    "przypisze kategorie i zapyta Cię o potwierdzenie przed wysyłką do Twojej bazy.\n\n"
-    "🧾 <b>Kolejka paragonów</b>\n"
-    "/pending — oczekujące paragony do decyzji\n"
-    "/items &lt;id&gt; — podgląd odczytanych pozycji z paragonu\n"
-    "/confirm &lt;id|all&gt; — zatwierdź i wyślij JSON do swojej bazy\n"
-    "/reject &lt;id|all&gt; — odrzuć i usuń paragon\n"
-    "/status — statystyki kolejki\n"
-    "/history — ostatnie 10 zatwierdzonych paragonów\n\n"
-    "⚙️ <b>Konfiguracja Twojej bazy i modelu AI</b>\n"
-    "/my_config — pokaż Twój klucz API, webhook i ustawienia\n"
-    "/set_webhook &lt;url&gt; [token] — ustaw adres docelowy dla wyników\n"
-    "/test_webhook — wyślij testowy ping do swojej bazy\n"
-    "/set_model &lt;openai|gemini&gt; &lt;model&gt; — zmień model OCR w locie\n"
-    "/set_categories &lt;kat1, kat2, ...|default&gt; — ustaw własne podkategorie"
+    "🤖 <b>Receipt OCR Bot</b>\n\n"
+    "📸 Send one or more receipt photos to extract and classify line items.\n\n"
+    "📄 <b>Commands</b>\n"
+    "/pending — list pending receipts\n"
+    "/items &lt;id&gt; — inspect extracted items for a receipt\n"
+    "/confirm &lt;id|all&gt; — confirm receipt(s) and send JSON to your webhook\n"
+    "/reject &lt;id|all&gt; — reject and delete receipt(s)\n"
+    "/status — queue overview\n"
+    "/history — last 10 confirmed receipts"
 )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message and configuration hint."""
+    """Welcome message."""
     tenant = _get_tenant(context)
     if tenant is None or not update.effective_chat or not update.message:
         return
     if not is_allowed_chat(tenant, update.effective_chat.id):
         return
-    webhook_info = (
-        f"✅ Docelowy webhook: <code>{tenant['webhook_url']}</code>"
-        if tenant.get("webhook_url")
-        else "⚠️ Nie ustawiłeś jeszcze docelowej bazy! Użyj <code>/set_webhook &lt;url&gt; [token]</code>."
-    )
     await update.message.reply_text(
-        f"Cześć <b>{tenant['name']}</b>! (Twój Chat ID: <code>{update.effective_chat.id}</code>)\n"
-        f"{webhook_info}\n\n{HELP_TEXT}",
+        f"Hi <b>{tenant['name']}</b>! (Chat ID: <code>{update.effective_chat.id}</code>)\n\n"
+        f"{HELP_TEXT}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -320,26 +310,26 @@ async def cmd_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(tenant, update.effective_chat.id):
         return
     if not context.args:
-        await update.message.reply_text("Użycie: /items <job_id>")
+        await update.message.reply_text("Usage: /items <job_id>")
         return
     try:
         job_id = int(context.args[0].lstrip("#"))
     except ValueError:
-        await update.message.reply_text("Podaj poprawny numer ID paragonu, np. /items 1")
+        await update.message.reply_text("Please provide a valid receipt ID, e.g. /items 1")
         return
 
     job = jobs_repo.get_job(job_id, tenant_id=tenant["id"])
     if job is None:
-        await update.message.reply_text(f"Paragon #{job_id} nie istnieje.")
+        await update.message.reply_text(f"Receipt #{job_id} not found.")
         return
 
     items = json.loads(job["items_json"]) if job.get("items_json") else []
     header = f"🧾 {render_job_summary(job)}\n"
     if not items:
-        await update.message.reply_text(header + "Brak odczytanych pozycji.")
+        await update.message.reply_text(header + "No line items found.")
         return
 
-    lines = [header, "Pozycje:"]
+    lines = [header, "Items:"]
     for idx, item in enumerate(items, start=1):
         subcat = item.get("subcategory") or "—"
         clean = item.get("clean_name") or item.get("name")
@@ -352,7 +342,7 @@ async def cmd_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Confirm one job or all pending jobs and deliver to the tenant's webhook."""
+    """Confirm one job or all pending jobs and deliver JSON to the tenant's webhook."""
     tenant = _get_tenant(context)
     if tenant is None or not update.effective_chat or not update.message:
         return
@@ -365,26 +355,26 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             outcome = await asyncio.to_thread(queue_service.confirm_job, tenant["id"], value)
             if outcome["webhook_delivered"]:
                 msg = (
-                    f"✅ Potwierdzono paragon #{outcome['job_id']} "
+                    f"✅ Confirmed receipt #{outcome['job_id']} "
                     f"({outcome['store_name']} · {outcome['total_amount']:.2f} {outcome['currency']}) "
-                    f"i wysłano do Twojej bazy (HTTP {outcome['webhook_status_code']})."
+                    f"and sent JSON to your destination webhook (HTTP {outcome['webhook_status_code']})."
                 )
             else:
                 msg = (
-                    f"✅ Potwierdzono paragon #{outcome['job_id']} "
+                    f"✅ Confirmed receipt #{outcome['job_id']} "
                     f"({outcome['store_name']} · {outcome['total_amount']:.2f} {outcome['currency']}).\n"
-                    "ℹ️ Brak ustawionego webhooka (/set_webhook) — wynik zapisany tylko w historii huba."
+                    "ℹ️ No destination webhook configured in the Web Dashboard."
                 )
             await update.message.reply_text(msg)
         elif selector == "all":
             outcomes = await asyncio.to_thread(queue_service.confirm_all, tenant["id"])
             await update.message.reply_text(
-                f"✅ Potwierdzono i przetworzono {len(outcomes)} paragon(ów)."
+                f"✅ Confirmed and processed {len(outcomes)} receipt(s)."
             )
         else:
-            await update.message.reply_text("Użycie: /confirm <job_id | all>")
+            await update.message.reply_text("Usage: /confirm <job_id | all>")
     except (ValueError, RuntimeError) as exc:
-        await update.message.reply_text(f"❌ Nie udało się potwierdzić: {exc}")
+        await update.message.reply_text(f"❌ Could not confirm: {exc}")
 
 
 async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -399,14 +389,14 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if selector == "single" and value is not None:
         ok = await asyncio.to_thread(queue_service.reject_job, tenant["id"], value)
         if ok:
-            await update.message.reply_text(f"🗑️ Odrzucono i usunięto paragon #{value}.")
+            await update.message.reply_text(f"🗑️ Rejected and deleted receipt #{value}.")
         else:
-            await update.message.reply_text(f"Paragon #{value} nie został znaleziony.")
+            await update.message.reply_text(f"Receipt #{value} not found.")
     elif selector == "all":
         rejected = await asyncio.to_thread(queue_service.reject_all, tenant["id"])
-        await update.message.reply_text(f"🗑️ Odrzucono {len(rejected)} paragon(ów).")
+        await update.message.reply_text(f"🗑️ Rejected {len(rejected)} receipt(s).")
     else:
-        await update.message.reply_text("Użycie: /reject <job_id | all>")
+        await update.message.reply_text("Usage: /reject <job_id | all>")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -419,173 +409,16 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     confirmed = jobs_repo.list_jobs(tenant_id=tenant["id"], status=jobs_repo.CONFIRMED)[-10:]
     if not confirmed:
-        await update.message.reply_text("Brak potwierdzonych paragonów w historii.")
+        await update.message.reply_text("No confirmed receipts yet.")
         return
     await update.message.reply_text(
-        "📜 Ostatnio potwierdzone paragony:\n"
+        "📜 Recently confirmed receipts:\n"
         + "\n".join(f"• {render_job_summary(job)}" for job in confirmed)
     )
 
 
-async def cmd_set_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Configure or clear the destination webhook URL and optional Bearer token."""
-    tenant = _get_tenant(context)
-    if tenant is None or not update.effective_chat or not update.message:
-        return
-    if not is_allowed_chat(tenant, update.effective_chat.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Użycie:\n"
-            "/set_webhook < https://twoja-baza.pl/webhook > [opcjonalny_bearer_token]\n"
-            "Lub aby wyczyścić: /set_webhook clear"
-        )
-        return
-
-    first_arg = context.args[0].strip()
-    if first_arg.lower() in ("clear", "none", "off"):
-        tenants_repo.update_tenant(tenant["id"], webhook_url=None, webhook_secret=None)
-        await update.message.reply_text("🧹 Wyczyszczono ustawienia docelowego webhooka.")
-        return
-
-    if not (first_arg.startswith("http://") or first_arg.startswith("https://")):
-        await update.message.reply_text("❌ Adres URL musiaczynać się od http:// lub https://")
-        return
-
-    secret = context.args[1].strip() if len(context.args) > 1 else tenant.get("webhook_secret")
-    tenants_repo.update_tenant(tenant["id"], webhook_url=first_arg, webhook_secret=secret)
-    secret_info = "ustawiony (Bearer)" if secret else "brak"
-    await update.message.reply_text(
-        f"✅ Zapisano docelowe miejsce wysyłki wyników:\n"
-        f"• URL: {first_arg}\n"
-        f"• Token autoryzacji: {secret_info}\n\n"
-        "Możesz przetestować połączenie komendą /test_webhook"
-    )
-
-
-async def cmd_test_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a test POST request to the tenant's configured webhook URL."""
-    tenant = _get_tenant(context)
-    if tenant is None or not update.effective_chat or not update.message:
-        return
-    if not is_allowed_chat(tenant, update.effective_chat.id):
-        return
-
-    result = await asyncio.to_thread(webhook_dispatcher.send_test_webhook, tenant)
-    if result["ok"]:
-        await update.message.reply_text(
-            f"✅ Połączenie z Twoją bazą działa! (HTTP {result['status_code']})\n"
-            f"Odpowiedź: {result['detail']}"
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ Test webhooka nie powiódł się (HTTP {result['status_code']}):\n{result['detail']}"
-        )
-
-
-async def cmd_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Change the cloud OCR provider and model for this tenant on the fly."""
-    tenant = _get_tenant(context)
-    if tenant is None or not update.effective_chat or not update.message:
-        return
-    if not is_allowed_chat(tenant, update.effective_chat.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Użycie:\n"
-            "• /set_model openai gpt-4o-mini\n"
-            "• /set_model openai gpt-4o\n"
-            "• /set_model gemini gemini-2.5-flash\n"
-            "• /set_model default (przywraca domyślny model serwera)"
-        )
-        return
-
-    if context.args[0].lower() == "default":
-        tenants_repo.update_tenant(tenant["id"], ocr_provider=None, ocr_model=None)
-        await update.message.reply_text(
-            f"✅ Przywrócono domyślny model serwera ({config.OCR_PROVIDER} / {config.OCR_MODEL})."
-        )
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Podaj dostawcę (openai lub gemini) oraz nazwę modelu.")
-        return
-
-    provider = context.args[0].strip().lower()
-    model = context.args[1].strip()
-    if provider not in ("openai", "gemini", "openrouter"):
-        await update.message.reply_text("❌ Dostawca musi być jednym z: openai, gemini, openrouter.")
-        return
-
-    tenants_repo.update_tenant(tenant["id"], ocr_provider=provider, ocr_model=model)
-    await update.message.reply_text(f"✅ Ustawiono model OCR: {provider} / {model}")
-
-
-async def cmd_set_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Customize item classification subcategories for this tenant."""
-    tenant = _get_tenant(context)
-    if tenant is None or not update.effective_chat or not update.message:
-        return
-    if not is_allowed_chat(tenant, update.effective_chat.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Użycie:\n"
-            "/set_categories nabiał, mięso, warzywa, owoce, inne\n"
-            "Lub aby przywrócić domyślne: /set_categories default"
-        )
-        return
-
-    raw_text = " ".join(context.args).strip()
-    if raw_text.lower() == "default":
-        tenants_repo.update_tenant(tenant["id"], subcategories=None)
-        await update.message.reply_text(
-            f"✅ Przywrócono domyślne podkategorie Biometera:\n{', '.join(config.DEFAULT_SUBCATEGORIES)}"
-        )
-        return
-
-    categories = [c.strip() for c in raw_text.split(",") if c.strip()]
-    if not categories:
-        await update.message.reply_text("❌ Podaj przynajmniej jedną podkategorię.")
-        return
-
-    tenants_repo.update_tenant(tenant["id"], subcategories=categories)
-    await update.message.reply_text(
-        f"✅ Zapisano własne podkategorie ({len(categories)}):\n{', '.join(categories)}"
-    )
-
-
-async def cmd_my_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display the tenant's current settings, webhook URL, and personal REST API key."""
-    tenant = _get_tenant(context)
-    if tenant is None or not update.effective_chat or not update.message:
-        return
-    if not is_allowed_chat(tenant, update.effective_chat.id):
-        return
-
-    provider = tenant.get("ocr_provider") or f"{config.OCR_PROVIDER} (domyślny)"
-    model = tenant.get("ocr_model") or f"{config.OCR_MODEL} (domyślny)"
-    webhook = tenant.get("webhook_url") or "brak (ustaw przez /set_webhook)"
-    has_secret = "tak" if tenant.get("webhook_secret") else "nie"
-    subcats = ", ".join(tenant.get("subcategories") or config.DEFAULT_SUBCATEGORIES)
-
-    text = (
-        f"⚙️ <b>Konfiguracja profilu: {tenant['name']}</b>\n\n"
-        f"🔑 <b>Twój API Key (do REST API):</b>\n<code>{tenant['api_key']}</code>\n\n"
-        f"🌐 <b>Docelowy Webhook (Twoja baza):</b>\n<code>{webhook}</code>\n"
-        f"🔒 <b>Bearer Token dla webhooka:</b> {has_secret}\n\n"
-        f"🧠 <b>Silnik OCR:</b> <code>{provider}</code> / <code>{model}</code>\n"
-        f"💱 <b>Domyślna waluta:</b> <code>{tenant.get('default_currency', 'PLN')}</code>\n"
-        f"🏷️ <b>Podkategorie:</b> {subcats}"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
 def register_handlers(application: Application) -> None:
-    """Attach all photo and command handlers to a tenant's Telegram Application."""
+    """Attach photo and queue confirmation handlers to a tenant's Telegram Application."""
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
@@ -595,8 +428,3 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("confirm", cmd_confirm))
     application.add_handler(CommandHandler("reject", cmd_reject))
     application.add_handler(CommandHandler("history", cmd_history))
-    application.add_handler(CommandHandler("set_webhook", cmd_set_webhook))
-    application.add_handler(CommandHandler("test_webhook", cmd_test_webhook))
-    application.add_handler(CommandHandler("set_model", cmd_set_model))
-    application.add_handler(CommandHandler("set_categories", cmd_set_categories))
-    application.add_handler(CommandHandler("my_config", cmd_my_config))

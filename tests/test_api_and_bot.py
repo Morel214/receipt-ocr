@@ -1,5 +1,6 @@
-"""Integration tests for FastAPI endpoints and Telegram bot commands."""
+"""Integration tests for Web Dashboard, simplified API endpoints, and Telegram photo bot."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,49 +10,37 @@ from ocr_hub.bot import handlers
 from ocr_hub.db.models import ReceiptItem, ReceiptOCRResult
 
 
-def test_admin_create_tenant_and_parse_receipt_via_api(
+def test_web_dashboard_and_simplified_api(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 1. Admin creates a new friend tenant
+    # 1. Web Dashboard renders at GET /
+    home_resp = client.get("/")
+    assert home_resp.status_code == 200
+    assert "Receipt OCR Hub" in home_resp.text
+
+    # 2. Create a bot/user via POST /api/bots
     resp = client.post(
-        "/api/v1/admin/tenants",
+        "/api/bots",
         headers={"X-Admin-Key": "test-admin-secret"},
         json={
-            "name": "Kamil",
-            "webhook_url": "https://kamil-homelab.local/api/receipts",
-            "webhook_secret": "kamil-token",
+            "name": "Alex",
+            "webhook_url": "https://alex-homelab.local/api/receipts",
+            "webhook_secret": "alex-token",
             "default_currency": "EUR",
+            "ocr_provider": "gemini",
+            "ocr_model": "gemini-2.5-flash",
+            "classifier_provider": "deepseek",
+            "classifier_model": "deepseek-chat",
         },
     )
     assert resp.status_code == 201
-    tenant_data = resp.json()
-    api_key = tenant_data["api_key"]
+    bot_data = resp.json()
+    api_key = bot_data["api_key"]
     assert api_key.startswith("ocr_live_")
-    assert tenant_data["name"] == "Kamil"
+    assert bot_data["ocr_model"] == "gemini-2.5-flash"
+    assert bot_data["classifier_model"] == "deepseek-chat"
 
-    # 2. Friend checks their profile with their personal API key
-    me_resp = client.get(
-        "/api/v1/me",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    assert me_resp.status_code == 200
-    assert me_resp.json()["webhook_url"] == "https://kamil-homelab.local/api/receipts"
-
-    # 3. Friend updates their subcategories and model via self-service API
-    cfg_resp = client.put(
-        "/api/v1/me/config",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "subcategories": ["dairy", "meat", "snacks"],
-            "ocr_provider": "gemini",
-            "ocr_model": "gemini-2.5-flash",
-        },
-    )
-    assert cfg_resp.status_code == 200
-    assert cfg_resp.json()["subcategories"] == ["dairy", "meat", "snacks"]
-    assert cfg_resp.json()["ocr_model"] == "gemini-2.5-flash"
-
-    # 4. Friend sends a receipt image to /api/v1/ocr/parse
+    # 3. Parse a receipt using the simplified POST /api/ocr endpoint
     monkeypatch.setattr(
         "ocr_hub.services.ocr_engine.analyze_receipt_image",
         lambda **kwargs: ReceiptOCRResult(
@@ -63,8 +52,7 @@ def test_admin_create_tenant_and_parse_receipt_via_api(
             items=[
                 ReceiptItem(
                     name="JUMBO KIPFILET",
-                    clean_name="filet z kurczaka",
-                    category="FOOD",
+                    clean_name="chicken breast",
                     subcategory="meat",
                     quantity=1.0,
                     unit_price=14.20,
@@ -76,23 +64,34 @@ def test_admin_create_tenant_and_parse_receipt_via_api(
     )
 
     parse_resp = client.post(
-        "/api/v1/ocr/parse",
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": ("paragon.jpg", b"fake-jpeg-data", "image/jpeg")},
+        "/api/ocr",
+        headers={"X-API-Key": api_key},
+        files={"file": ("receipt.jpg", b"fake-jpeg-data", "image/jpeg")},
     )
     assert parse_resp.status_code == 200
     parsed = parse_resp.json()
-    assert parsed["store_name"] == "Jumbo"
-    assert parsed["total_amount"] == 14.20
-    assert parsed["items"][0]["clean_name"] == "filet z kurczaka"
-    assert parsed["items"][0]["subcategory"] == "meat"
+    assert parsed == {
+        "store_name": "Jumbo",
+        "transaction_date": "2026-10-22",
+        "total_amount": 14.20,
+        "currency": "EUR",
+        "items": [
+            {
+                "name": "JUMBO KIPFILET",
+                "clean_name": "chicken breast",
+                "subcategory": "meat",
+                "quantity": 1.0,
+                "unit_price": 14.20,
+                "total_price": 14.20,
+            }
+        ],
+    }
 
 
-def test_telegram_set_webhook_and_set_model_commands(temp_db) -> None:
-    import asyncio
+def test_telegram_bot_has_only_photo_and_queue_commands(temp_db) -> None:
     from ocr_hub.repositories import tenants_repo
 
-    tenant = tenants_repo.create_tenant(name="TelegramUser")
+    tenant = tenants_repo.create_tenant(name="PhotoBotUser")
 
     update = MagicMock()
     update.effective_chat.id = 555111
@@ -101,20 +100,9 @@ def test_telegram_set_webhook_and_set_model_commands(temp_db) -> None:
     context = MagicMock()
     context.application.bot_data = {"tenant_id": tenant["id"]}
 
-    # /set_webhook
-    context.args = ["https://moja-baza.pl/api/webhook", "moj-sekret-123"]
-    asyncio.run(handlers.cmd_set_webhook(update, context))
-
-    updated = tenants_repo.get_tenant_by_id(tenant["id"])
-    assert updated is not None
-    assert updated["webhook_url"] == "https://moja-baza.pl/api/webhook"
-    assert updated["webhook_secret"] == "moj-sekret-123"
-
-    # /set_model
-    context.args = ["gemini", "gemini-2.5-flash"]
-    asyncio.run(handlers.cmd_set_model(update, context))
-
-    updated = tenants_repo.get_tenant_by_id(tenant["id"])
-    assert updated is not None
-    assert updated["ocr_provider"] == "gemini"
-    assert updated["ocr_model"] == "gemini-2.5-flash"
+    asyncio.run(handlers.cmd_help(update, context))
+    help_reply = update.message.reply_text.call_args[0][0]
+    assert "/confirm" in help_reply
+    assert "/reject" in help_reply
+    assert "/set_webhook" not in help_reply
+    assert "/set_model" not in help_reply
