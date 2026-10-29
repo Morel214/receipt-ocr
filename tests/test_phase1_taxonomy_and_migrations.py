@@ -86,7 +86,12 @@ def test_global_taxonomy_api_crud_and_stage2_prompt_integration(client: TestClie
     assert upd_resp.json()["name_pl"] == "karma i akcesoria"
     assert "pet_food" not in taxonomy_repo.get_active_subcategory_codes()
 
-    all_tax = client.get("/api/taxonomy?include_inactive=true").json()
+    # Guest without admin_headers only sees active subcategories; Admin sees inactive ones too
+    guest_tax = client.get("/api/taxonomy?include_inactive=true").json()
+    guest_pets = next(c for c in guest_tax["categories"] if c["code"] == "PETS")
+    assert guest_pets["subcategories"] == []
+
+    all_tax = client.get("/api/taxonomy?include_inactive=true", headers=admin_headers).json()
     pets_tree = next(c for c in all_tax["categories"] if c["code"] == "PETS")
     assert pets_tree["subcategories"][0]["code"] == "pet_food"
     assert pets_tree["subcategories"][0]["is_active"] is False

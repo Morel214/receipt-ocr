@@ -41,6 +41,42 @@ def get_current_tenant(
     return tenant
 
 
+def check_optional_admin_key(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+) -> bool:
+    """Return True only when ADMIN_API_KEY is configured in .env and the caller supplied a matching key."""
+    if not config.ADMIN_API_KEY:
+        return False
+
+    provided = None
+    if x_admin_key:
+        provided = x_admin_key.strip()
+    elif credentials and credentials.credentials:
+        provided = credentials.credentials.strip()
+
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, config.ADMIN_API_KEY)
+
+
+def require_strict_admin_key(
+    is_admin: bool = Security(check_optional_admin_key),
+) -> str:
+    """Require a configured and valid ADMIN_API_KEY (used for editing/stopping/deleting shared taxonomy & catalog)."""
+    if not config.ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ADMIN_API_KEY is not configured on the server. Set ADMIN_API_KEY in .env to enable admin edits.",
+        )
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin API key required for this action.",
+        )
+    return config.ADMIN_API_KEY
+
+
 def verify_admin_key(
     credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),

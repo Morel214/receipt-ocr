@@ -16,7 +16,12 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import HTMLResponse
 
 from ocr_hub import config
-from ocr_hub.api.auth import get_current_tenant, verify_admin_key
+from ocr_hub.api.auth import (
+    check_optional_admin_key,
+    get_current_tenant,
+    require_strict_admin_key,
+    verify_admin_key,
+)
 from ocr_hub.api.web_ui import render_dashboard_html
 from ocr_hub.bot.bot_manager import bot_manager
 from ocr_hub.db.migrations import list_applied_migrations
@@ -29,7 +34,7 @@ from ocr_hub.db.models import (
     TenantUpdateConfigRequest,
 )
 from ocr_hub.db.schema import init_db
-from ocr_hub.repositories import jobs_repo, taxonomy_repo, tenants_repo
+from ocr_hub.repositories import catalog_repo, jobs_repo, taxonomy_repo, tenants_repo
 from ocr_hub.services import ocr_engine, queue_service, webhook_dispatcher
 
 logger = logging.getLogger(__name__)
@@ -412,51 +417,95 @@ async def list_my_jobs(
 
 
 # ==============================================================================
-# Global Taxonomy Endpoints (Categories & Subcategories in PL / EN)
+# Admin Status & Global Taxonomy Endpoints (Categories & Subcategories in PL/EN)
 # ==============================================================================
+
+
+@app.get("/api/admin/status", tags=["Health"])
+async def admin_auth_status(
+    is_admin: bool = Depends(check_optional_admin_key),
+) -> dict[str, Any]:
+    """Return whether ADMIN_API_KEY is configured and whether the caller holds a valid Admin Key."""
+    return {
+        "admin_key_configured": bool(config.ADMIN_API_KEY),
+        "is_admin": is_admin,
+    }
 
 
 @app.get("/api/taxonomy", tags=["Taxonomy"])
 async def get_taxonomy(
     include_inactive: bool = Query(default=False),
+    is_admin: bool = Depends(check_optional_admin_key),
 ) -> dict[str, Any]:
-    """Return the shared global category and subcategory tree (PL & EN)."""
+    """Return the shared global category and subcategory tree (PL & EN).
+
+    Non-admin callers only receive active, confirmed taxonomy entries.
+    """
+    show_all = bool(include_inactive and is_admin)
     return {
-        "categories": taxonomy_repo.get_taxonomy_tree(only_active=not include_inactive),
+        "categories": taxonomy_repo.get_taxonomy_tree(only_active=not show_all),
         "active_subcategory_codes": taxonomy_repo.get_active_subcategory_codes(),
+        "is_admin": is_admin,
     }
+
+
+@app.get(
+    "/api/taxonomy/pending",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Taxonomy"],
+)
+async def list_pending_taxonomy_suggestions() -> dict[str, Any]:
+    """Return manual_user category and subcategory suggestions awaiting Admin approval."""
+    return taxonomy_repo.list_pending_taxonomy()
 
 
 @app.post(
     "/api/taxonomy/categories",
-    dependencies=[Depends(verify_admin_key)],
     status_code=status.HTTP_201_CREATED,
     tags=["Taxonomy"],
 )
-async def create_taxonomy_category(payload: CategoryCreateRequest) -> dict[str, Any]:
-    """Create a new top-level category in the global taxonomy."""
+async def create_taxonomy_category(
+    payload: CategoryCreateRequest,
+    is_admin: bool = Depends(check_optional_admin_key),
+) -> dict[str, Any]:
+    """Create a category (confirmed immediately for Admin; queued as pending manual_user otherwise)."""
     try:
         return taxonomy_repo.create_category(
             code=payload.code,
             name_pl=payload.name_pl,
             name_en=payload.name_en,
             sort_order=payload.sort_order,
-            is_active=payload.is_active,
+            is_active=payload.is_active if is_admin else False,
+            status="confirmed" if is_admin else "pending",
+            source="admin" if is_admin else "manual_user",
         )
     except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
+@app.post(
+    "/api/taxonomy/categories/{category_id}/approve",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Taxonomy"],
+)
+async def approve_taxonomy_category(category_id: int) -> dict[str, Any]:
+    """Approve a pending manual_user category so it enters the active taxonomy."""
+    approved = taxonomy_repo.approve_category(category_id)
+    if approved is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return approved
+
+
 @app.put(
     "/api/taxonomy/categories/{category_id}",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(require_strict_admin_key)],
     tags=["Taxonomy"],
 )
 async def update_taxonomy_category(
     category_id: int,
     payload: CategoryUpdateRequest,
 ) -> dict[str, Any]:
-    """Update a category's code, PL/EN names, sort order, or active flag."""
+    """Update a category's code, PL/EN names, sort order, or active flag (Admin Key required)."""
     try:
         updated = taxonomy_repo.update_category(
             category_id, **payload.model_dump(exclude_unset=True)
@@ -470,11 +519,11 @@ async def update_taxonomy_category(
 
 @app.delete(
     "/api/taxonomy/categories/{category_id}",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(require_strict_admin_key)],
     tags=["Taxonomy"],
 )
 async def delete_taxonomy_category(category_id: int) -> dict[str, Any]:
-    """Delete a category (and its cascaded subcategories) from the global taxonomy."""
+    """Delete a category (and its cascaded subcategories) from the global taxonomy (Admin Key required)."""
     deleted = taxonomy_repo.delete_category(category_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Category not found")
@@ -483,13 +532,16 @@ async def delete_taxonomy_category(category_id: int) -> dict[str, Any]:
 
 @app.post(
     "/api/taxonomy/subcategories",
-    dependencies=[Depends(verify_admin_key)],
     status_code=status.HTTP_201_CREATED,
     tags=["Taxonomy"],
 )
-async def create_taxonomy_subcategory(payload: SubcategoryCreateRequest) -> dict[str, Any]:
-    """Create a new subcategory under an existing category."""
-    if taxonomy_repo.get_category_by_id(payload.category_id) is None:
+async def create_taxonomy_subcategory(
+    payload: SubcategoryCreateRequest,
+    is_admin: bool = Depends(check_optional_admin_key),
+) -> dict[str, Any]:
+    """Create a subcategory (confirmed immediately for Admin; queued as pending manual_user otherwise)."""
+    parent = taxonomy_repo.get_category_by_id(payload.category_id)
+    if parent is None:
         raise HTTPException(status_code=404, detail="Parent category not found")
     try:
         return taxonomy_repo.create_subcategory(
@@ -498,22 +550,37 @@ async def create_taxonomy_subcategory(payload: SubcategoryCreateRequest) -> dict
             name_pl=payload.name_pl,
             name_en=payload.name_en,
             sort_order=payload.sort_order,
-            is_active=payload.is_active,
+            is_active=payload.is_active if is_admin else False,
+            status="confirmed" if is_admin else "pending",
+            source="admin" if is_admin else "manual_user",
         )
     except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
+@app.post(
+    "/api/taxonomy/subcategories/{subcategory_id}/approve",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Taxonomy"],
+)
+async def approve_taxonomy_subcategory(subcategory_id: int) -> dict[str, Any]:
+    """Approve a pending manual_user subcategory so it enters the active taxonomy."""
+    approved = taxonomy_repo.approve_subcategory(subcategory_id)
+    if approved is None:
+        raise HTTPException(status_code=404, detail="Subcategory not found")
+    return approved
+
+
 @app.put(
     "/api/taxonomy/subcategories/{subcategory_id}",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(require_strict_admin_key)],
     tags=["Taxonomy"],
 )
 async def update_taxonomy_subcategory(
     subcategory_id: int,
     payload: SubcategoryUpdateRequest,
 ) -> dict[str, Any]:
-    """Update a subcategory's parent category, code, PL/EN names, sort order, or active flag."""
+    """Update a subcategory's parent category, code, PL/EN names, sort order, or active flag (Admin Key required)."""
     try:
         updated = taxonomy_repo.update_subcategory(
             subcategory_id, **payload.model_dump(exclude_unset=True)
@@ -527,12 +594,18 @@ async def update_taxonomy_subcategory(
 
 @app.delete(
     "/api/taxonomy/subcategories/{subcategory_id}",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(require_strict_admin_key)],
     tags=["Taxonomy"],
 )
 async def delete_taxonomy_subcategory(subcategory_id: int) -> dict[str, Any]:
-    """Delete a subcategory from the global taxonomy."""
+    """Delete a subcategory from the global taxonomy (Admin Key required)."""
     deleted = taxonomy_repo.delete_subcategory(subcategory_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Subcategory not found")
     return {"subcategory_id": subcategory_id, "deleted": True}
+
+
+@app.get("/api/catalog/stats", tags=["Catalog"])
+async def get_catalog_overview() -> dict[str, Any]:
+    """Return summary counts for the shared product catalog, aliases, stores, and pending suggestions."""
+    return catalog_repo.get_catalog_stats()

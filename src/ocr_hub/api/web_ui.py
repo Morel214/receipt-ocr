@@ -225,9 +225,10 @@ def render_dashboard_html() -> str:
           <code>Stage 2 Classifier = {config.CLASSIFIER_PROVIDER}/{config.CLASSIFIER_MODEL}</code>
         </div>
       </div>
-      <div style="display:flex; align-items:center; gap:12px;">
-        <input type="password" id="adminKeyInput" placeholder="Admin Key (if set in .env)"
-               style="width:190px; padding:6px 10px; font-size:0.8rem;"
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <span id="adminStatusBadge" class="badge off">🔒 Guest Mode</span>
+        <input type="password" id="adminKeyInput" placeholder="Admin Key"
+               style="width:180px; padding:6px 10px; font-size:0.8rem;"
                onchange="saveAdminKey()" />
         <a href="/docs" style="color: var(--accent); text-decoration: none; font-weight: 600;">Swagger API Docs &rarr;</a>
       </div>
@@ -439,6 +440,7 @@ def render_dashboard_html() -> str:
   <script>
     let cachedBots = [];
     let cachedCategories = [];
+    let isAdmin = false;
 
     function getAdminHeaders(extra = {{}}) {{
       const key = localStorage.getItem('ocr_admin_key') || '';
@@ -447,11 +449,33 @@ def render_dashboard_html() -> str:
       return headers;
     }}
 
-    function saveAdminKey() {{
+    async function refreshAdminStatus() {{
+      const badge = document.getElementById('adminStatusBadge');
+      try {{
+        const res = await fetch('/api/admin/status', {{ headers: getAdminHeaders() }});
+        const data = await res.json();
+        isAdmin = Boolean(data.is_admin);
+        if (isAdmin) {{
+          badge.className = 'badge ok';
+          badge.innerText = '🟢 Admin Unlocked';
+        }} else if (!data.admin_key_configured) {{
+          badge.className = 'badge off';
+          badge.innerText = '🔒 Set ADMIN_API_KEY in .env for Admin Edits';
+        }} else {{
+          badge.className = 'badge off';
+          badge.innerText = '🔒 Guest Mode';
+        }}
+      }} catch (e) {{
+        isAdmin = false;
+      }}
+    }}
+
+    async function saveAdminKey() {{
       const val = document.getElementById('adminKeyInput').value.trim();
       localStorage.setItem('ocr_admin_key', val);
-      loadBots();
-      loadTaxonomy();
+      await refreshAdminStatus();
+      await loadBots();
+      await loadTaxonomy();
     }}
 
     async function loadBots() {{
@@ -497,14 +521,16 @@ def render_dashboard_html() -> str:
     }}
 
     async function loadTaxonomy() {{
-      const res = await fetch('/api/taxonomy?include_inactive=true');
+      const res = await fetch('/api/taxonomy?include_inactive=true', {{ headers: getAdminHeaders() }});
       const data = await res.json();
+      isAdmin = Boolean(data.is_admin);
       cachedCategories = data.categories || [];
 
       const parentSelect = document.getElementById('newSubCatParent');
-      parentSelect.innerHTML = cachedCategories.map(c =>
-        `<option value="${{c.id}}">${{c.code}} (${{c.name_pl}} / ${{c.name_en}})</option>`
-      ).join('');
+      parentSelect.innerHTML = cachedCategories
+        .filter(c => c.status !== 'pending' || isAdmin)
+        .map(c => `<option value="${{c.id}}">${{c.code}} (${{c.name_pl}} / ${{c.name_en}})</option>`)
+        .join('');
 
       const container = document.getElementById('taxonomyContainer');
       if (!cachedCategories.length) {{
@@ -512,35 +538,71 @@ def render_dashboard_html() -> str:
         return;
       }}
 
-      container.innerHTML = cachedCategories.map(cat => `
-        <div class="cat-box">
-          <div class="bot-header">
-            <div>
-              <strong><code>${{cat.code}}</code> — PL: ${{cat.name_pl}} | EN: ${{cat.name_en}}</strong>
-              <span class="badge ${{cat.is_active ? 'ok' : 'off'}}">${{cat.is_active ? 'Active' : 'Inactive'}}</span>
-            </div>
-            <div class="actions">
-              <button class="secondary small" onclick="renameCategory(${{cat.id}})">Edit Names</button>
-              <button class="secondary small" onclick="toggleCategory(${{cat.id}}, ${{!cat.is_active}})">
-                ${{cat.is_active ? 'Disable' : 'Enable'}}
-              </button>
-              <button class="danger small" onclick="removeCategory(${{cat.id}}, '${{cat.code}}')">Delete</button>
-            </div>
+      container.innerHTML = cachedCategories.map(cat => {{
+        const catPending = cat.status === 'pending';
+        const catAdminActions = isAdmin ? `
+          <div class="actions">
+            ${{catPending ? `<button class=" small" onclick="approveCategory(${{cat.id}})">✅ Approve</button>` : ''}}
+            <button class="secondary small" onclick="renameCategory(${{cat.id}})">Edit Names</button>
+            <button class="secondary small" onclick="toggleCategory(${{cat.id}}, ${{!cat.is_active}})">
+              ${{cat.is_active ? 'Disable' : 'Enable'}}
+            </button>
+            <button class="danger small" onclick="removeCategory(${{cat.id}}, '${{cat.code}}')">Delete</button>
           </div>
-          <div class="subcat-grid">
-            ${{(cat.subcategories || []).map(sub => `
-              <div class="subcat-chip ${{sub.is_active ? '' : 'inactive'}}">
-                <span><code>${{sub.code}}</code> · <b>PL:</b> ${{sub.name_pl}} · <b>EN:</b> ${{sub.name_en}}</span>
-                <button class="secondary small" title="Edit PL/EN names" onclick="renameSubcategory(${{sub.id}})">✏️</button>
-                <button class="secondary small" title="Toggle active" onclick="toggleSubcategory(${{sub.id}}, ${{!sub.is_active}})">
-                  ${{sub.is_active ? '⏸' : '▶️'}}
-                </button>
-                <button class="danger small" title="Delete subcategory" onclick="removeSubcategory(${{sub.id}}, '${{sub.code}}')">✕</button>
+        ` : '';
+
+        return `
+          <div class="cat-box">
+            <div class="bot-header">
+              <div>
+                <strong><code>${{cat.code}}</code> — PL: ${{cat.name_pl}} | EN: ${{cat.name_en}}</strong>
+                <span class="badge ${{cat.is_active && !catPending ? 'ok' : 'off'}}">
+                  ${{catPending ? '⏳ manual_user pending' : (cat.is_active ? 'Active' : 'Inactive')}}
+                </span>
               </div>
-            `).join('') || '<span class="sub">No subcategories in this category.</span>'}}
+              ${{catAdminActions}}
+            </div>
+            <div class="subcat-grid">
+              ${{(cat.subcategories || []).map(sub => {{
+                const subPending = sub.status === 'pending';
+                const subAdminBtns = isAdmin ? `
+                  ${{subPending ? `<button class="small" title="Approve manual_user suggestion" onclick="approveSubcategory(${{sub.id}})">✅</button>` : ''}}
+                  <button class="secondary small" title="Edit PL/EN names" onclick="renameSubcategory(${{sub.id}})">✏️</button>
+                  <button class="secondary small" title="Toggle active" onclick="toggleSubcategory(${{sub.id}}, ${{!sub.is_active}})">
+                    ${{sub.is_active ? '⏸' : '▶️'}}
+                  </button>
+                  <button class="danger small" title="Delete subcategory" onclick="removeSubcategory(${{sub.id}}, '${{sub.code}}')">✕</button>
+                ` : '';
+                return `
+                  <div class="subcat-chip ${{(sub.is_active && !subPending) ? '' : 'inactive'}}">
+                    <span>
+                      <code>${{sub.code}}</code> · <b>PL:</b> ${{sub.name_pl}} · <b>EN:</b> ${{sub.name_en}}
+                      ${{subPending ? ' <i>(⏳ manual_user)</i>' : ''}}
+                    </span>
+                    ${{subAdminBtns}}
+                  </div>
+                `;
+              }}).join('') || '<span class="sub">No subcategories in this category.</span>'}}
+            </div>
           </div>
-        </div>
-      `).join('');
+        `;
+      }}).join('');
+    }}
+
+    async function approveCategory(catId) {{
+      const res = await fetch(`/api/taxonomy/categories/${{catId}}/approve`, {{
+        method: 'POST',
+        headers: getAdminHeaders(),
+      }});
+      if (res.ok) await loadTaxonomy();
+    }}
+
+    async function approveSubcategory(subId) {{
+      const res = await fetch(`/api/taxonomy/subcategories/${{subId}}/approve`, {{
+        method: 'POST',
+        headers: getAdminHeaders(),
+      }});
+      if (res.ok) await loadTaxonomy();
     }}
 
     async function addCategory() {{
@@ -565,7 +627,9 @@ def render_dashboard_html() -> str:
       document.getElementById('newCatCode').value = '';
       document.getElementById('newCatPl').value = '';
       document.getElementById('newCatEn').value = '';
-      statusEl.innerText = `✅ Added category ${{data.code}}`;
+      statusEl.innerText = data.status === 'pending'
+        ? `⏳ Submitted '${{data.code}}' (manual_user) — inactive until approved by Admin in Catalog.`
+        : `✅ Added active category ${{data.code}}`;
       await loadTaxonomy();
     }}
 
@@ -625,7 +689,9 @@ def render_dashboard_html() -> str:
       document.getElementById('newSubCode').value = '';
       document.getElementById('newSubPl').value = '';
       document.getElementById('newSubEn').value = '';
-      statusEl.innerText = `✅ Added subcategory ${{data.code}}`;
+      statusEl.innerText = data.status === 'pending'
+        ? `⏳ Submitted '${{data.code}}' (manual_user) — inactive until approved by Admin in Catalog.`
+        : `✅ Added active subcategory ${{data.code}}`;
       await loadTaxonomy();
     }}
 
@@ -791,8 +857,11 @@ def render_dashboard_html() -> str:
     }}
 
     document.getElementById('adminKeyInput').value = localStorage.getItem('ocr_admin_key') || '';
-    loadBots();
-    loadTaxonomy();
+    (async () => {{
+      await refreshAdminStatus();
+      await loadBots();
+      await loadTaxonomy();
+    }})();
   </script>
 </body>
 </html>
