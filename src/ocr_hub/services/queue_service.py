@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ocr_hub import config
-from ocr_hub.repositories import jobs_repo, tenants_repo
+from ocr_hub.repositories import jobs_repo, taxonomy_repo, tenants_repo
 from ocr_hub.services.ocr_engine import (
     analyze_receipt_image,
     generate_receipt_filename,
@@ -101,9 +101,9 @@ def ocr_one_job(
             model=tenant.get("ocr_model"),
             classifier_provider=tenant.get("classifier_provider"),
             classifier_model=tenant.get("classifier_model"),
-            subcategories=tenant.get("subcategories"),
-            default_currency=tenant.get("default_currency", "EUR"),
-            language=tenant.get("language", "en"),
+            subcategories=taxonomy_repo.get_active_subcategory_codes(database_path=database_path),
+            default_currency=tenant.get("default_currency", "PLN"),
+            language=tenant.get("language", "pl"),
         )
     except Exception as exc:
         logger.error("[ocr_one_job] Job %s OCR failed: %s", job_id, exc)

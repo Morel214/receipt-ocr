@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from ocr_hub.db.connection import get_connection
+from ocr_hub.db.migrations import run_migrations
 
 
 def init_db(database_path: str | Path | None = None) -> None:
@@ -84,3 +85,6 @@ def init_db(database_path: str | Path | None = None) -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_tenant_batch ON receipt_jobs(tenant_id, batch_id);"
         )
+
+        # Apply versioned schema migrations (global taxonomy, catalog, etc.)
+        run_migrations(conn)

@@ -19,9 +19,17 @@ from ocr_hub import config
 from ocr_hub.api.auth import get_current_tenant, verify_admin_key
 from ocr_hub.api.web_ui import render_dashboard_html
 from ocr_hub.bot.bot_manager import bot_manager
-from ocr_hub.db.models import TenantCreateRequest, TenantUpdateConfigRequest
+from ocr_hub.db.migrations import list_applied_migrations
+from ocr_hub.db.models import (
+    CategoryCreateRequest,
+    CategoryUpdateRequest,
+    SubcategoryCreateRequest,
+    SubcategoryUpdateRequest,
+    TenantCreateRequest,
+    TenantUpdateConfigRequest,
+)
 from ocr_hub.db.schema import init_db
-from ocr_hub.repositories import jobs_repo, tenants_repo
+from ocr_hub.repositories import jobs_repo, taxonomy_repo, tenants_repo
 from ocr_hub.services import ocr_engine, queue_service, webhook_dispatcher
 
 logger = logging.getLogger(__name__)
@@ -36,9 +44,9 @@ def _serialize_tenant(tenant: dict[str, Any], include_secrets: bool = True) -> d
         "name": tenant["name"],
         "webhook_url": tenant.get("webhook_url"),
         "has_webhook_secret": bool(tenant.get("webhook_secret")),
-        "default_currency": tenant.get("default_currency", "EUR"),
-        "language": tenant.get("language", "en"),
-        "subcategories": tenant.get("subcategories") or config.DEFAULT_SUBCATEGORIES,
+        "default_currency": tenant.get("default_currency", "PLN"),
+        "language": tenant.get("language", "pl"),
+        "subcategories": taxonomy_repo.get_active_subcategory_codes(),
         "ocr_provider": tenant.get("ocr_provider") or config.OCR_PROVIDER,
         "ocr_model": tenant.get("ocr_model") or config.OCR_MODEL,
         "classifier_provider": tenant.get("classifier_provider") or config.CLASSIFIER_PROVIDER,
@@ -95,6 +103,7 @@ async def health_check() -> dict[str, Any]:
         "status": "ok",
         "service": "receipt-ocr-hub",
         "active_telegram_bots": len(bot_manager.running_tenant_ids()),
+        "schema_version": (list_applied_migrations() or [{"version": 0}])[-1]["version"],
         "default_ocr_provider": config.OCR_PROVIDER,
         "default_ocr_model": config.OCR_MODEL,
         "default_classifier_provider": config.CLASSIFIER_PROVIDER,
@@ -132,7 +141,7 @@ async def _handle_ocr_parse(
     custom_subcats = (
         [s.strip() for s in subcategories.split(",") if s.strip()]
         if subcategories
-        else tenant.get("subcategories")
+        else taxonomy_repo.get_active_subcategory_codes()
     )
 
     try:
@@ -400,3 +409,130 @@ async def list_my_jobs(
 ) -> list[dict[str, Any]]:
     """List receipt jobs belonging to the authenticated user."""
     return jobs_repo.list_jobs(tenant_id=tenant["id"], status=job_status)
+
+
+# ==============================================================================
+# Global Taxonomy Endpoints (Categories & Subcategories in PL / EN)
+# ==============================================================================
+
+
+@app.get("/api/taxonomy", tags=["Taxonomy"])
+async def get_taxonomy(
+    include_inactive: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Return the shared global category and subcategory tree (PL & EN)."""
+    return {
+        "categories": taxonomy_repo.get_taxonomy_tree(only_active=not include_inactive),
+        "active_subcategory_codes": taxonomy_repo.get_active_subcategory_codes(),
+    }
+
+
+@app.post(
+    "/api/taxonomy/categories",
+    dependencies=[Depends(verify_admin_key)],
+    status_code=status.HTTP_201_CREATED,
+    tags=["Taxonomy"],
+)
+async def create_taxonomy_category(payload: CategoryCreateRequest) -> dict[str, Any]:
+    """Create a new top-level category in the global taxonomy."""
+    try:
+        return taxonomy_repo.create_category(
+            code=payload.code,
+            name_pl=payload.name_pl,
+            name_en=payload.name_en,
+            sort_order=payload.sort_order,
+            is_active=payload.is_active,
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put(
+    "/api/taxonomy/categories/{category_id}",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Taxonomy"],
+)
+async def update_taxonomy_category(
+    category_id: int,
+    payload: CategoryUpdateRequest,
+) -> dict[str, Any]:
+    """Update a category's code, PL/EN names, sort order, or active flag."""
+    try:
+        updated = taxonomy_repo.update_category(
+            category_id, **payload.model_dump(exclude_unset=True)
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return updated
+
+
+@app.delete(
+    "/api/taxonomy/categories/{category_id}",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Taxonomy"],
+)
+async def delete_taxonomy_category(category_id: int) -> dict[str, Any]:
+    """Delete a category (and its cascaded subcategories) from the global taxonomy."""
+    deleted = taxonomy_repo.delete_category(category_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return {"category_id": category_id, "deleted": True}
+
+
+@app.post(
+    "/api/taxonomy/subcategories",
+    dependencies=[Depends(verify_admin_key)],
+    status_code=status.HTTP_201_CREATED,
+    tags=["Taxonomy"],
+)
+async def create_taxonomy_subcategory(payload: SubcategoryCreateRequest) -> dict[str, Any]:
+    """Create a new subcategory under an existing category."""
+    if taxonomy_repo.get_category_by_id(payload.category_id) is None:
+        raise HTTPException(status_code=404, detail="Parent category not found")
+    try:
+        return taxonomy_repo.create_subcategory(
+            category_id=payload.category_id,
+            code=payload.code,
+            name_pl=payload.name_pl,
+            name_en=payload.name_en,
+            sort_order=payload.sort_order,
+            is_active=payload.is_active,
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put(
+    "/api/taxonomy/subcategories/{subcategory_id}",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Taxonomy"],
+)
+async def update_taxonomy_subcategory(
+    subcategory_id: int,
+    payload: SubcategoryUpdateRequest,
+) -> dict[str, Any]:
+    """Update a subcategory's parent category, code, PL/EN names, sort order, or active flag."""
+    try:
+        updated = taxonomy_repo.update_subcategory(
+            subcategory_id, **payload.model_dump(exclude_unset=True)
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Subcategory not found")
+    return updated
+
+
+@app.delete(
+    "/api/taxonomy/subcategories/{subcategory_id}",
+    dependencies=[Depends(verify_admin_key)],
+    tags=["Taxonomy"],
+)
+async def delete_taxonomy_subcategory(subcategory_id: int) -> dict[str, Any]:
+    """Delete a subcategory from the global taxonomy."""
+    deleted = taxonomy_repo.delete_subcategory(subcategory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Subcategory not found")
+    return {"subcategory_id": subcategory_id, "deleted": True}

@@ -20,6 +20,7 @@ import requests
 
 from ocr_hub import config
 from ocr_hub.db.models import ReceiptOCRResult
+from ocr_hub.repositories import taxonomy_repo
 
 logger = logging.getLogger(__name__)
 
@@ -66,18 +67,13 @@ def build_stage_2_classifier_prompt(
     language: str = "en",
 ) -> str:
     """Build the prompt for Stage 2 (Text LLM filling in clean_name and subcategory)."""
-    allowed_subcats = subcategories or config.DEFAULT_SUBCATEGORIES
+    allowed_subcats = subcategories or taxonomy_repo.get_active_subcategory_codes()
     subcats_formatted = ", ".join(f'"{s}"' for s in allowed_subcats)
     lang_map = {
         "en": "English",
         "pl": "Polish",
-        "nl": "Dutch",
-        "de": "German",
-        "es": "Spanish",
-        "fr": "French",
-        "it": "Italian",
     }
-    lang_desc = lang_map.get(language.lower(), language)
+    lang_desc = lang_map.get(language.strip().lower(), "English")
 
     return (
         "You are a receipt product normalizer and classifier.\n"

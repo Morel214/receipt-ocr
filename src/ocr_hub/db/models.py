@@ -48,6 +48,9 @@ class ReceiptOCRResult(BaseModel):
     items: list[ReceiptItem] = Field(default_factory=list)
 
 
+SUPPORTED_LANGUAGES = ("en", "pl")
+
+
 class TenantCreateRequest(BaseModel):
     """Payload for registering a new user/bot and their destination webhook."""
 
@@ -56,13 +59,22 @@ class TenantCreateRequest(BaseModel):
     allowed_chat_ids: list[int] = Field(default_factory=list)
     webhook_url: str | None = None
     webhook_secret: str | None = None
-    default_currency: str = Field(default="EUR", max_length=10)
-    language: str = Field(default="en", max_length=10)
+    default_currency: str = Field(default="PLN", max_length=10)
+    language: str = Field(default="pl", max_length=10)
     subcategories: list[str] | None = None
     ocr_provider: str | None = None
     ocr_model: str | None = None
     classifier_provider: str | None = None
     classifier_model: str | None = None
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        """Restrict language selection to English ('en') or Polish ('pl')."""
+        lang = value.strip().lower()
+        if lang not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language '{value}'. Allowed: {SUPPORTED_LANGUAGES}")
+        return lang
 
 
 class TenantUpdateConfigRequest(BaseModel):
@@ -80,6 +92,59 @@ class TenantUpdateConfigRequest(BaseModel):
     classifier_model: str | None = None
     allowed_chat_ids: list[int] | None = None
     telegram_bot_token: str | None = None
+    is_active: bool | None = None
+
+    @field_validator("language")
+    @classmethod
+    def validate_optional_language(cls, value: str | None) -> str | None:
+        """Restrict language selection to English ('en') or Polish ('pl') when provided."""
+        if value is None:
+            return None
+        lang = value.strip().lower()
+        if lang not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language '{value}'. Allowed: {SUPPORTED_LANGUAGES}")
+        return lang
+
+
+class CategoryCreateRequest(BaseModel):
+    """Payload for creating a global taxonomy category."""
+
+    code: str = Field(min_length=1, max_length=50)
+    name_pl: str = Field(min_length=1, max_length=100)
+    name_en: str = Field(min_length=1, max_length=100)
+    sort_order: int = 100
+    is_active: bool = True
+
+
+class CategoryUpdateRequest(BaseModel):
+    """Payload for updating a global taxonomy category."""
+
+    code: str | None = Field(default=None, min_length=1, max_length=50)
+    name_pl: str | None = Field(default=None, min_length=1, max_length=100)
+    name_en: str | None = Field(default=None, min_length=1, max_length=100)
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
+class SubcategoryCreateRequest(BaseModel):
+    """Payload for creating a global taxonomy subcategory."""
+
+    category_id: int
+    code: str = Field(min_length=1, max_length=60)
+    name_pl: str = Field(min_length=1, max_length=100)
+    name_en: str = Field(min_length=1, max_length=100)
+    sort_order: int = 100
+    is_active: bool = True
+
+
+class SubcategoryUpdateRequest(BaseModel):
+    """Payload for updating a global taxonomy subcategory."""
+
+    category_id: int | None = None
+    code: str | None = Field(default=None, min_length=1, max_length=60)
+    name_pl: str | None = Field(default=None, min_length=1, max_length=100)
+    name_en: str | None = Field(default=None, min_length=1, max_length=100)
+    sort_order: int | None = None
     is_active: bool | None = None
 
 
