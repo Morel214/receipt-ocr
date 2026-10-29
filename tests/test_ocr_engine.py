@@ -124,6 +124,8 @@ def test_two_stage_pipeline_with_distinct_models(monkeypatch: pytest.MonkeyPatch
         model="gemini-2.5-flash",
         classifier_provider="deepseek",
         classifier_model="deepseek-chat",
+        language="en",
+        persist_catalog=False,
     )
 
     assert len(calls) == 2

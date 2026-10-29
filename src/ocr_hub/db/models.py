@@ -11,11 +11,21 @@ class ReceiptItem(BaseModel):
 
     name: str = Field(min_length=1, max_length=200)
     clean_name: str = Field(default="", max_length=200)
+    category: str | None = Field(default=None, max_length=100)
     subcategory: str | None = Field(default=None, max_length=100)
+    unit: str = Field(default="pcs", max_length=20)
     quantity: float = Field(default=1.0, gt=0)
     unit_price: float = Field(ge=-1000000)
     total_price: float = Field(ge=-1000000)
     confidence: float | None = Field(default=None, ge=0, le=1)
+    product_id: int | None = None
+    name_pl: str | None = None
+    name_en: str | None = None
+    brand: str | None = None
+    off_search_query: str | None = None
+    pack_amount: float | None = None
+    pack_unit: str | None = None
+    match_source: str = Field(default="llm", max_length=30)
 
     @field_validator("clean_name", mode="before")
     @classmethod
@@ -26,25 +36,41 @@ class ReceiptItem(BaseModel):
         text = str(value).strip()
         return "" if text.lower() in ("", "null", "[null]", "none") else text
 
-    @field_validator("subcategory", mode="before")
+    @field_validator("subcategory", "category", mode="before")
     @classmethod
-    def normalize_subcategory(cls, value: Any) -> str | None:
-        """Coerce null/missing subcategory to None."""
+    def normalize_optional_taxonomy(cls, value: Any) -> str | None:
+        """Coerce null/missing category or subcategory to None."""
         if value is None:
             return None
         text = str(value).strip()
         return None if text.lower() in ("", "null", "[null]", "none") else text
+
+    @field_validator("unit", mode="before")
+    @classmethod
+    def normalize_unit(cls, value: Any) -> str:
+        """Normalize receipt quantity unit strictly to 'pcs', 'kg', or 'l'."""
+        if value is None:
+            return "pcs"
+        u = str(value).strip().lower().rstrip(".")
+        if u in ("kg", "kilogram", "kilograms", "waga"):
+            return "kg"
+        if u in ("l", "litr", "liter", "liters", "litre"):
+            return "l"
+        return "pcs"
 
 
 class ReceiptOCRResult(BaseModel):
     """Structured OCR and product classification result."""
 
     receipt_id: int | None = None
+    store_id: int | None = None
     store_name: str = Field(default="Unknown Store", min_length=1, max_length=200)
     transaction_date: date | None = None
     total_amount: float = Field(default=0.0, ge=0)
-    currency: str = Field(default="EUR", max_length=10)
-    confidence: float | None = Field(default=None, ge=0, le=1)
+    currency: str = Field(default="PLN", max_length=10)
+    confidence: float | None = None
+    cache_hits: int = 0
+    llm_classified_count: int = 0
     items: list[ReceiptItem] = Field(default_factory=list)
 
 

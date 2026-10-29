@@ -75,14 +75,22 @@ def test_web_dashboard_and_simplified_api(
         "transaction_date": "2026-10-22",
         "total_amount": 14.20,
         "currency": "EUR",
+        "cache_hits": 0,
+        "llm_classified_count": 0,
         "items": [
             {
                 "name": "JUMBO KIPFILET",
                 "clean_name": "chicken breast",
+                "category": None,
                 "subcategory": "meat",
+                "unit": "pcs",
                 "quantity": 1.0,
                 "unit_price": 14.20,
                 "total_price": 14.20,
+                "product_id": None,
+                "brand": None,
+                "off_search_query": None,
+                "match_source": "llm",
             }
         ],
     }

@@ -383,30 +383,50 @@ def render_dashboard_html() -> str:
   "transaction_date": "2026-10-28",
   "total_amount": 21.48,
   "currency": "PLN",
+  "cache_hits": 1,
+  "llm_classified_count": 1,
   "items": [
     {{
       "name": "JAJA MOJA KURKA M 10",
       "clean_name": "jajka",
+      "category": "FOOD",
       "subcategory": "eggs",
+      "unit": "pcs",
       "quantity": 1.0,
       "unit_price": 8.99,
-      "total_price": 8.99
+      "total_price": 8.99,
+      "product_id": 1,
+      "brand": "Moja Kurka",
+      "off_search_query": "Moja Kurka jaja M 10 szt",
+      "match_source": "cache"
     }},
     {{
       "name": "MLEKO LACIATE 3,2% 1L",
       "clean_name": "mleko 3.2%",
+      "category": "FOOD",
       "subcategory": "dairy",
+      "unit": "pcs",
       "quantity": 3.0,
       "unit_price": 4.49,
-      "total_price": 13.47
+      "total_price": 13.47,
+      "product_id": 2,
+      "brand": "Łaciate",
+      "off_search_query": "Łaciate mleko 3.2% 1L",
+      "match_source": "llm"
     }},
     {{
       "name": "RABAT MLEKO 3W2",
       "clean_name": "Rabat",
+      "category": null,
       "subcategory": null,
+      "unit": "pcs",
       "quantity": 1.0,
       "unit_price": -0.98,
-      "total_price": -0.98
+      "total_price": -0.98,
+      "product_id": null,
+      "brand": null,
+      "off_search_query": null,
+      "match_source": "rule"
     }}
   ]
 }}</code></pre>
@@ -424,12 +444,15 @@ def render_dashboard_html() -> str:
               <tr><td><code>transaction_date</code></td><td>string</td><td>Purchase date strictly formatted as <code>YYYY-MM-DD</code>.</td></tr>
               <tr><td><code>total_amount</code></td><td>float</td><td>Final total amount paid on the receipt.</td></tr>
               <tr><td><code>currency</code></td><td>string</td><td>Three-letter currency code (e.g. "PLN", "EUR").</td></tr>
+              <tr><td><code>cache_hits</code></td><td>int</td><td>Items matched directly from catalog cache (skipping Stage 2 LLM).</td></tr>
               <tr><td><code>items[].name</code></td><td>string</td><td>Exact original printed item text from the receipt.</td></tr>
               <tr><td><code>items[].clean_name</code></td><td>string</td><td>Generic clean product name in user's chosen language (<code>pl</code> or <code>en</code>).</td></tr>
-              <tr><td><code>items[].subcategory</code></td><td>string | null</td><td>Code from the shared Global Taxonomy (or <code>null</code> for discounts).</td></tr>
-              <tr><td><code>items[].quantity</code></td><td>float</td><td>Quantity or weight (default 1.0).</td></tr>
-              <tr><td><code>items[].unit_price</code></td><td>float</td><td>Unit price (negative for discounts/rebates).</td></tr>
-              <tr><td><code>items[].total_price</code></td><td>float</td><td>Total line price after quantity (negative for discounts).</td></tr>
+              <tr><td><code>items[].category / subcategory</code></td><td>string | null</td><td>Codes from the shared Global Taxonomy (<code>null</code> for discounts).</td></tr>
+              <tr><td><code>items[].unit</code></td><td>string</td><td>Normalized unit: <code>"pcs"</code>, <code>"kg"</code>, or <code>"l"</code>.</td></tr>
+              <tr><td><code>items[].quantity / unit_price / total_price</code></td><td>float</td><td>Quantity, unit price, and total line price (negative for discounts).</td></tr>
+              <tr><td><code>items[].product_id</code></td><td>int | null</td><td>Shared catalog product ID.</td></tr>
+              <tr><td><code>items[].off_search_query</code></td><td>string | null</td><td>Decoded brand + specific product phrase for Open Food Facts lookup.</td></tr>
+              <tr><td><code>items[].match_source</code></td><td>string</td><td><code>"cache"</code>, <code>"llm"</code>, <code>"rule"</code> (discounts), or <code>"user"</code>.</td></tr>
             </tbody>
           </table>
         </div>

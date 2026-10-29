@@ -159,8 +159,8 @@ async def _handle_ocr_parse(
             classifier_provider=classifier_provider or tenant.get("classifier_provider"),
             classifier_model=classifier_model or tenant.get("classifier_model"),
             subcategories=custom_subcats,
-            default_currency=currency or tenant.get("default_currency", "EUR"),
-            language=language or tenant.get("language", "en"),
+            default_currency=currency or tenant.get("default_currency", "PLN"),
+            language=language or tenant.get("language", "pl"),
         )
     except Exception as exc:
         logger.exception("[_handle_ocr_parse] OCR failed for tenant %s", tenant["name"])
@@ -174,14 +174,22 @@ async def _handle_ocr_parse(
         "transaction_date": str(ocr_result.transaction_date) if ocr_result.transaction_date else None,
         "total_amount": float(ocr_result.total_amount),
         "currency": ocr_result.currency,
+        "cache_hits": ocr_result.cache_hits,
+        "llm_classified_count": ocr_result.llm_classified_count,
         "items": [
             {
                 "name": item.name,
                 "clean_name": item.clean_name,
+                "category": item.category,
                 "subcategory": item.subcategory,
+                "unit": item.unit,
                 "quantity": item.quantity,
                 "unit_price": item.unit_price,
                 "total_price": item.total_price,
+                "product_id": item.product_id,
+                "brand": item.brand,
+                "off_search_query": item.off_search_query,
+                "match_source": item.match_source,
             }
             for item in ocr_result.items
         ],

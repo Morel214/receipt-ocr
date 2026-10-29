@@ -9,6 +9,7 @@ from ocr_hub import config
 from ocr_hub.repositories import jobs_repo, taxonomy_repo, tenants_repo
 from ocr_hub.services.ocr_engine import (
     analyze_receipt_image,
+    commit_result_to_catalog,
     generate_receipt_filename,
     normalize_store_name,
     validate_ocr_result,
@@ -104,6 +105,8 @@ def ocr_one_job(
             subcategories=taxonomy_repo.get_active_subcategory_codes(database_path=database_path),
             default_currency=tenant.get("default_currency", "PLN"),
             language=tenant.get("language", "pl"),
+            persist_catalog=False,
+            database_path=database_path,
         )
     except Exception as exc:
         logger.error("[ocr_one_job] Job %s OCR failed: %s", job_id, exc)
@@ -113,7 +116,8 @@ def ocr_one_job(
         raise
 
     result_dict = result.model_dump(mode="json")
-    result_dict["store_name"] = normalize_store_name(result_dict.get("store_name"))
+    if not result_dict.get("store_name"):
+        result_dict["store_name"] = "Unknown Store"
     jobs_repo.update_job_ocr(job_id, result_dict, database_path=database_path)
 
     item_confidences = [
@@ -206,7 +210,7 @@ def confirm_job(
         raise ValueError(f"Tenant not found (tenant_id={tenant_id}).")
 
     result = validate_ocr_result(json.loads(job["ocr_json"]))
-    store_name = normalize_store_name(result.store_name)
+    store_name = result.store_name or normalize_store_name(result.store_name)
     txn_date = str(result.transaction_date) if result.transaction_date else ""
     total_amount = float(result.total_amount)
 
@@ -222,6 +226,14 @@ def confirm_job(
         raise ValueError(
             f"Receipt #{job_id} is a duplicate of already confirmed receipt #{existing_id} "
             f"({store_name} / {txn_date} / {total_amount:.2f}). Use /reject {job_id}."
+        )
+
+    # Commit anonymized product & alias mappings into the shared catalog once upon confirmation
+    if job.get("status") != jobs_repo.DELIVERY_FAILED:
+        result = commit_result_to_catalog(result, source="llm", database_path=database_path)
+        store_name = result.store_name or store_name
+        jobs_repo.update_job_ocr(
+            job_id, result.model_dump(mode="json"), database_path=database_path
         )
 
     try:
