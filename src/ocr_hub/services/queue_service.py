@@ -3,10 +3,11 @@
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 from ocr_hub import config
-from ocr_hub.repositories import jobs_repo, taxonomy_repo, tenants_repo
+from ocr_hub.repositories import catalog_repo, jobs_repo, receipts_repo, taxonomy_repo, tenants_repo
 from ocr_hub.services.ocr_engine import (
     analyze_receipt_image,
     commit_result_to_catalog,
@@ -24,6 +25,319 @@ CONFIRMABLE_STATUSES = (
     jobs_repo.AWAITING_EDIT,
     jobs_repo.DELIVERY_FAILED,
 )
+
+_KNOWN_EDIT_KEYS = (
+    "off_search_query",
+    "transaction_date",
+    "total_amount",
+    "total_price",
+    "subcategory",
+    "store_name",
+    "unit_price",
+    "raw_name",
+    "currency",
+    "quantity",
+    "name_pl",
+    "name_en",
+    "subcat",
+    "store",
+    "total",
+    "price",
+    "brand",
+    "date",
+    "name",
+    "unit",
+    "qty",
+    "off",
+    "raw",
+)
+_EDIT_KEY_RE = re.compile(
+    r"(?:^|\s+)(" + "|".join(_KNOWN_EDIT_KEYS) + r")\s*=\s*",
+    flags=re.IGNORECASE,
+)
+_ITEM_PREFIX_RE = re.compile(r"^\s*#?(\d+)\s+(.+?)\s*$", flags=re.DOTALL)
+
+
+def parse_edit_assignments(spec: str) -> dict[str, str]:
+    """Parse ``key=value`` pairs from a mobile-friendly Telegram ``/edit`` command string.
+
+    Supports both unquoted multi-word values (``name=ser żółty price=12,99``) and quoted values.
+    """
+    matches = list(_EDIT_KEY_RE.finditer(spec))
+    if not matches or matches[0].start() > 0 and spec[: matches[0].start()].strip():
+        return {}
+
+    parsed: dict[str, str] = {}
+    for idx, match in enumerate(matches):
+        key = match.group(1).lower()
+        val_start = match.end()
+        val_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(spec)
+        raw_val = spec[val_start:val_end].strip()
+        if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in ('"', "'"):
+            raw_val = raw_val[1:-1].strip()
+        parsed[key] = raw_val
+    return parsed
+
+
+def _parse_decimal(raw_value: str, field_name: str) -> float:
+    """Parse a dot- or Polish comma-formatted decimal number."""
+    cleaned = raw_value.strip().replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid number for '{field_name}': '{raw_value}'.") from exc
+
+
+def edit_job_before_confirm(
+    tenant_id: int,
+    job_id: int,
+    edit_spec: str,
+    database_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Apply header or line-item corrections to an open receipt job prior to ``/confirm``.
+
+    Supported forms:
+        - ``<item_no> delete`` — remove an erroneous OCR line item (1-based index).
+        - ``<item_no> name=ser żółty subcat=dairy qty=1 unit=pcs price=12.99`` — edit item fields.
+        - ``store=Biedronka date=2026-10-28 total=54.30 currency=PLN`` — edit receipt header
+          (``total=sum`` recalculates receipt total from line items).
+    """
+    job = jobs_repo.get_job(job_id, tenant_id=tenant_id, database_path=database_path)
+    if job is None:
+        raise ValueError(f"Receipt job #{job_id} not found.")
+    if job.get("status") not in CONFIRMABLE_STATUSES:
+        raise ValueError(
+            f"Receipt #{job_id} cannot be edited in status '{job.get('status')}'."
+        )
+    if not job.get("ocr_json"):
+        raise ValueError(f"Receipt #{job_id} has no OCR payload to edit.")
+
+    spec = (edit_spec or "").strip()
+    if not spec:
+        raise ValueError(
+            f"Empty edit command. Example: /edit {job_id} 1 name=jajka price=9.99 or /edit {job_id} total=54.30"
+        )
+
+    tenant = tenants_repo.get_tenant_by_id(tenant_id, database_path=database_path)
+    lang = "pl" if (tenant and str(tenant.get("language", "pl")).lower() == "pl") else "en"
+
+    result = validate_ocr_result(json.loads(job["ocr_json"]))
+    subcat_map = {
+        s["code"].lower(): s
+        for cat in taxonomy_repo.get_taxonomy_tree(only_active=True, database_path=database_path)
+        for s in cat.get("subcategories", [])
+    }
+    cat_id_to_code = {
+        int(cat["id"]): str(cat["code"])
+        for cat in taxonomy_repo.get_taxonomy_tree(only_active=True, database_path=database_path)
+    }
+
+    item_match = _ITEM_PREFIX_RE.match(spec)
+    if item_match:
+        item_no = int(item_match.group(1))
+        rest = item_match.group(2).strip()
+        if item_no < 1 or item_no > len(result.items):
+            raise ValueError(
+                f"Item #{item_no} out of range (receipt #{job_id} has {len(result.items)} item(s))."
+            )
+
+        if rest.lower() in ("delete", "del", "rm", "remove"):
+            if len(result.items) <= 1:
+                raise ValueError(
+                    "Cannot delete the last remaining item on a receipt. Use /reject instead."
+                )
+            result.items.pop(item_no - 1)
+        else:
+            assignments = parse_edit_assignments(rest)
+            if not assignments:
+                raise ValueError(
+                    f"Could not parse item edits. Example: /edit {job_id} {item_no} name=jajka price=9.99 subcat=eggs"
+                )
+            target = result.items[item_no - 1]
+            classification_edited = False
+            qty_or_price_edited = False
+            explicit_total = False
+
+            if "raw" in assignments or "raw_name" in assignments:
+                raw_text = (assignments.get("raw_name") or assignments.get("raw") or "").strip()
+                if not raw_text:
+                    raise ValueError("Item raw name cannot be empty.")
+                target.name = raw_text
+
+            if "unit" in assignments:
+                u = assignments["unit"].strip().lower().rstrip(".")
+                if u not in ("pcs", "kg", "l", "szt", "litr"):
+                    raise ValueError("Allowed units: pcs, kg, l.")
+                target.unit = "kg" if u == "kg" else ("l" if u in ("l", "litr") else "pcs")
+
+            if "qty" in assignments or "quantity" in assignments:
+                raw_qty = assignments.get("quantity") or assignments.get("qty") or ""
+                qty_val = _parse_decimal(raw_qty, "qty")
+                if qty_val <= 0:
+                    raise ValueError("Quantity must be greater than 0.")
+                target.quantity = qty_val
+                qty_or_price_edited = True
+
+            if "price" in assignments or "unit_price" in assignments:
+                raw_price = assignments.get("unit_price") or assignments.get("price") or ""
+                target.unit_price = _parse_decimal(raw_price, "price")
+                qty_or_price_edited = True
+
+            if "total" in assignments or "total_price" in assignments:
+                raw_tot = assignments.get("total_price") or assignments.get("total") or ""
+                target.total_price = _parse_decimal(raw_tot, "total")
+                explicit_total = True
+
+            if qty_or_price_edited and not explicit_total:
+                target.total_price = round(float(target.quantity) * float(target.unit_price), 2)
+            elif explicit_total and not qty_or_price_edited and float(target.quantity) > 0:
+                target.unit_price = round(float(target.total_price) / float(target.quantity), 2)
+
+            explicit_subcat = assignments.get("subcategory") or assignments.get("subcat")
+            if explicit_subcat is not None:
+                sub_key = explicit_subcat.strip().lower()
+                if sub_key in ("none", "null", "-"):
+                    target.subcategory = None
+                    target.category = None
+                else:
+                    sub_obj = subcat_map.get(sub_key)
+                    if sub_obj is None:
+                        allowed_codes = ", ".join(sorted(subcat_map.keys()))
+                        raise ValueError(
+                            f"Unknown subcategory '{explicit_subcat}'. Active subcategories: {allowed_codes}"
+                        )
+                    target.subcategory = str(sub_obj["code"])
+                    target.category = cat_id_to_code.get(int(sub_obj["category_id"]))
+                classification_edited = True
+
+            if "brand" in assignments:
+                target.brand = assignments["brand"].strip() or None
+                classification_edited = True
+
+            if "off" in assignments or "off_search_query" in assignments:
+                off_val = (
+                    assignments.get("off_search_query")
+                    if "off_search_query" in assignments
+                    else assignments.get("off", "")
+                )
+                target.off_search_query = off_val.strip() or None
+                classification_edited = True
+
+            has_name_edit = any(k in assignments for k in ("name", "name_pl", "name_en"))
+            if has_name_edit:
+                classification_edited = True
+                new_clean = assignments.get("name", "").strip().lower()
+                new_pl = assignments.get("name_pl", "").strip().lower()
+                new_en = assignments.get("name_en", "").strip().lower()
+
+                lookup_pl = new_pl or (new_clean if lang == "pl" else "")
+                lookup_en = new_en or (new_clean if lang == "en" else "")
+                existing_prod = catalog_repo.find_product_by_clean_name(
+                    name_pl=lookup_pl or None,
+                    name_en=lookup_en or None,
+                    database_path=database_path,
+                )
+
+                if existing_prod is not None and not (new_pl and new_en):
+                    target.product_id = int(existing_prod["id"])
+                    target.name_pl = existing_prod["name_pl"]
+                    target.name_en = existing_prod["name_en"]
+                    target.clean_name = (
+                        existing_prod["name_pl"] if lang == "pl" else existing_prod["name_en"]
+                    )
+                    if explicit_subcat is None and existing_prod.get("subcategory_code"):
+                        target.subcategory = existing_prod["subcategory_code"]
+                        target.category = existing_prod.get("category_code")
+                else:
+                    base_name = new_clean or new_pl or new_en
+                    if not base_name:
+                        raise ValueError("Clean product name cannot be empty.")
+                    target.product_id = None
+                    target.name_pl = new_pl or base_name
+                    target.name_en = new_en or base_name
+                    target.clean_name = target.name_pl if lang == "pl" else target.name_en
+
+            if classification_edited:
+                target.match_source = "user"
+                target.alias_id = None
+    else:
+        assignments = parse_edit_assignments(spec)
+        if not assignments:
+            raise ValueError(
+                f"Could not parse edit command. Examples:\n"
+                f"• /edit {job_id} 1 name=jajka price=9.99 subcat=eggs\n"
+                f"• /edit {job_id} 2 delete\n"
+                f"• /edit {job_id} store=Biedronka date=2026-10-28 total=54.30"
+            )
+
+        if "store" in assignments or "store_name" in assignments:
+            raw_store = (assignments.get("store_name") or assignments.get("store") or "").strip()
+            if not raw_store:
+                raise ValueError("Store name cannot be empty.")
+            resolved = catalog_repo.resolve_store(
+                raw_store, auto_create=False, database_path=database_path
+            )
+            if resolved is not None:
+                result.store_id = int(resolved["id"])
+                result.store_name = resolved["display_name"]
+            else:
+                result.store_id = None
+                result.store_name = normalize_store_name(raw_store)
+
+        if "date" in assignments or "transaction_date" in assignments:
+            raw_date = (
+                assignments.get("transaction_date") or assignments.get("date") or ""
+            ).strip()
+            if raw_date.lower() in ("none", "null", "-"):
+                result.transaction_date = None
+            else:
+                # Re-validate ISO YYYY-MM-DD through ReceiptOCRResult validator
+                temp_payload = result.model_dump(mode="json")
+                temp_payload["transaction_date"] = raw_date
+                try:
+                    result = validate_ocr_result(temp_payload)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid date '{raw_date}'. Use YYYY-MM-DD (e.g. 2026-10-28)."
+                    ) from exc
+
+        if "total" in assignments or "total_amount" in assignments:
+            raw_total = (assignments.get("total_amount") or assignments.get("total") or "").strip()
+            if raw_total.lower() in ("sum", "auto"):
+                computed = round(sum(float(it.total_price) for it in result.items), 2)
+                result.total_amount = max(0.0, computed)
+            else:
+                tot_val = _parse_decimal(raw_total, "total")
+                if tot_val < 0:
+                    raise ValueError("Receipt total_amount cannot be negative.")
+                result.total_amount = tot_val
+
+        if "currency" in assignments:
+            curr = assignments["currency"].strip().upper()
+            if not curr or len(curr) > 10:
+                raise ValueError("Invalid currency code.")
+            result.currency = curr
+
+    validated_dict = validate_ocr_result(result.model_dump(mode="json")).model_dump(mode="json")
+    jobs_repo.update_job_ocr(job_id, validated_dict, database_path=database_path)
+
+    store_name = validated_dict.get("store_name") or ""
+    txn_date = str(validated_dict.get("transaction_date") or "")
+    total_amount = float(validated_dict.get("total_amount") or 0.0)
+    if store_name and txn_date and total_amount:
+        dup_id = jobs_repo.find_duplicate_confirmed_job(
+            tenant_id=tenant_id,
+            store_name=store_name,
+            transaction_date=txn_date,
+            total_amount=total_amount,
+            exclude_job_id=job_id,
+            database_path=database_path,
+        )
+        jobs_repo.set_job_duplicate(job_id, dup_id is not None, database_path=database_path)
+
+    updated = jobs_repo.get_job(job_id, tenant_id=tenant_id, database_path=database_path)
+    assert updated is not None
+    return updated
 
 
 def _content_type_for(path: str) -> str:
@@ -236,13 +550,29 @@ def confirm_job(
             job_id, result.model_dump(mode="json"), database_path=database_path
         )
 
-    try:
-        delivery = dispatch_receipt_webhook(tenant=tenant, result=result, job_id=job_id)
-    except RuntimeError as exc:
-        jobs_repo.set_job_status(
-            job_id, jobs_repo.DELIVERY_FAILED, str(exc), database_path=database_path
+    raw_modes = tenant.get("delivery_modes")
+    modes = list(raw_modes) if isinstance(raw_modes, list) else ["webhook"]
+
+    if "webhook" in modes:
+        try:
+            delivery = dispatch_receipt_webhook(tenant=tenant, result=result, job_id=job_id)
+        except RuntimeError as exc:
+            jobs_repo.set_job_status(
+                job_id, jobs_repo.DELIVERY_FAILED, str(exc), database_path=database_path
+            )
+            raise
+    else:
+        delivery = {"delivered": False, "status_code": None, "response": None}
+
+    hub_receipt_id: int | None = None
+    if "hub_db" in modes:
+        saved_receipt = receipts_repo.save_confirmed_receipt(
+            tenant_id=tenant_id,
+            result=result,
+            job_id=job_id,
+            database_path=database_path,
         )
-        raise
+        hub_receipt_id = int(saved_receipt["id"])
 
     jobs_repo.mark_job_confirmed(
         job_id=job_id,
@@ -251,6 +581,11 @@ def confirm_job(
         database_path=database_path,
     )
 
+    # Privacy guarantee: when hub_db is NOT enabled, remove local receipt photo and detailed line-item JSON
+    if "hub_db" not in modes:
+        _delete_image(job)
+        jobs_repo.clear_job_payload(job_id, database_path=database_path)
+
     try:
         process_next_queued_job(tenant_id=tenant_id, database_path=database_path)
     except Exception:
@@ -258,6 +593,9 @@ def confirm_job(
 
     return {
         "job_id": job_id,
+        "hub_receipt_id": hub_receipt_id,
+        "saved_to_hub_db": hub_receipt_id is not None,
+        "delivery_modes": modes,
         "store_name": store_name,
         "transaction_date": txn_date,
         "total_amount": total_amount,
@@ -266,6 +604,7 @@ def confirm_job(
         "webhook_delivered": delivery["delivered"],
         "webhook_status_code": delivery["status_code"],
         "webhook_response": delivery["response"],
+        "result": result.model_dump(mode="json"),
     }
 
 

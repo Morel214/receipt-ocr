@@ -8,6 +8,7 @@ from typing import Any
 
 from ocr_hub import config
 from ocr_hub.db.connection import get_connection
+from ocr_hub.db.models import normalize_delivery_modes
 
 
 def generate_api_key() -> str:
@@ -30,6 +31,19 @@ def _row_to_tenant(columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
             data["subcategories"] = list(config.DEFAULT_SUBCATEGORIES)
     else:
         data["subcategories"] = list(config.DEFAULT_SUBCATEGORIES)
+    raw_modes = data.get("delivery_modes_json")
+    if raw_modes is not None:
+        try:
+            parsed_modes = json.loads(raw_modes)
+            data["delivery_modes"] = (
+                normalize_delivery_modes(parsed_modes)
+                if isinstance(parsed_modes, list)
+                else ["webhook"]
+            )
+        except Exception:
+            data["delivery_modes"] = ["webhook"]
+    else:
+        data["delivery_modes"] = ["webhook"]
     data["is_active"] = bool(data.get("is_active", 1))
     return data
 
@@ -42,6 +56,7 @@ def create_tenant(
     webhook_secret: str | None = None,
     default_currency: str = "EUR",
     language: str = "en",
+    delivery_modes: list[str] | None = None,
     subcategories: list[str] | None = None,
     ocr_provider: str | None = None,
     ocr_model: str | None = None,
@@ -56,6 +71,10 @@ def create_tenant(
     subcats_json = (
         json.dumps(subcategories, ensure_ascii=False) if subcategories is not None else None
     )
+    modes_list = (
+        normalize_delivery_modes(delivery_modes) if delivery_modes is not None else ["webhook"]
+    )
+    modes_json = json.dumps(modes_list, ensure_ascii=False)
     clean_token = (
         telegram_bot_token.strip()
         if telegram_bot_token and telegram_bot_token.strip()
@@ -69,10 +88,10 @@ def create_tenant(
             INSERT INTO tenants (
                 name, api_key, telegram_bot_token, allowed_chat_ids,
                 webhook_url, webhook_secret, default_currency, language,
-                subcategories_json, ocr_provider, ocr_model,
+                delivery_modes_json, subcategories_json, ocr_provider, ocr_model,
                 classifier_provider, classifier_model, is_active
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
             """,
             (
                 name.strip(),
@@ -83,6 +102,7 @@ def create_tenant(
                 webhook_secret.strip() if webhook_secret else None,
                 default_currency.strip().upper(),
                 language.strip().lower(),
+                modes_json,
                 subcats_json,
                 ocr_provider.strip().lower() if ocr_provider else None,
                 ocr_model.strip() if ocr_model else None,
@@ -172,6 +192,7 @@ def update_tenant(
         "webhook_secret",
         "default_currency",
         "language",
+        "delivery_modes_json",
         "subcategories_json",
         "ocr_provider",
         "ocr_model",
@@ -181,6 +202,13 @@ def update_tenant(
     }
     updates: list[str] = []
     params: list[Any] = []
+
+    if "delivery_modes" in fields:
+        modes = fields.pop("delivery_modes")
+        if modes is not None:
+            fields["delivery_modes_json"] = json.dumps(
+                normalize_delivery_modes(modes), ensure_ascii=False
+            )
 
     if "subcategories" in fields:
         subcats = fields.pop("subcategories")

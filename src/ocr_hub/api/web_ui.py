@@ -213,6 +213,32 @@ def render_dashboard_html() -> str:
     .subcat-chip.inactive {{
       opacity: 0.5;
     }}
+    .modes-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 6px;
+    }}
+    @media (max-width: 600px) {{
+      .modes-grid {{ grid-template-columns: 1fr; }}
+    }}
+    .mode-option {{
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0b1120;
+      font-size: 0.83rem;
+      color: var(--text);
+      margin: 0;
+      cursor: pointer;
+    }}
+    .mode-option input {{
+      width: auto;
+      margin-top: 3px;
+    }}
   </style>
 </head>
 <body>
@@ -277,6 +303,29 @@ def render_dashboard_html() -> str:
         <label>Destination Webhook Bearer Secret (optional)</label>
         <input type="text" id="webhookSecret" placeholder="Optional Authorization Bearer token" />
 
+        <label>Post-Confirmation Delivery Modes (choose any combination)</label>
+        <div class="modes-grid">
+          <label class="mode-option">
+            <input type="checkbox" id="modeHubDb" value="hub_db" checked />
+            <span><b>🗄️ Save to Hub DB</b><br/><span class="sub" style="font-size:0.75rem;">Enables <code>/api/receipts</code> &amp; <code>/export</code></span></span>
+          </label>
+          <label class="mode-option">
+            <input type="checkbox" id="modeWebhook" value="webhook" checked />
+            <span><b>🔗 Send Webhook JSON</b><br/><span class="sub" style="font-size:0.75rem;">POSTs payload to Webhook URL</span></span>
+          </label>
+          <label class="mode-option">
+            <input type="checkbox" id="modeTgText" value="telegram_text" />
+            <span><b>📋 Telegram Copyable Text</b><br/><span class="sub" style="font-size:0.75rem;">Sends <code>&lt;pre&gt;</code> CSV block in chat</span></span>
+          </label>
+          <label class="mode-option">
+            <input type="checkbox" id="modeTgCsv" value="telegram_csv" />
+            <span><b>📄 Telegram CSV File</b><br/><span class="sub" style="font-size:0.75rem;">Attaches <code>.csv</code> file in chat</span></span>
+          </label>
+        </div>
+        <div class="sub" style="font-size:0.76rem; margin-top:6px;">
+          🔒 Privacy: Anonymized product names always teach the shared catalog on confirm, while personal receipts &amp; prices are stored on this server <b>only</b> if <code>Save to Hub DB</code> is checked.
+        </div>
+
         <div class="actions" style="margin-top: 16px;">
           <button onclick="saveBot()">💾 Save User / Bot</button>
           <button class="secondary" onclick="resetForm()">Clear Form</button>
@@ -298,6 +347,10 @@ def render_dashboard_html() -> str:
         <label style="display:flex; align-items:center; gap:8px; margin-top:12px;">
           <input type="checkbox" id="testSendWebhook" style="width:auto;" />
           Also forward final JSON to this user's Destination Webhook URL
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+          <input type="checkbox" id="testSaveHubDb" style="width:auto;" />
+          Also save parsed receipt into Hub DB (<code>GET /api/receipts</code>)
         </label>
 
         <button onclick="runOcrTest()">🚀 Parse Receipt Now</button>
@@ -537,6 +590,7 @@ def render_dashboard_html() -> str:
           <div class="sub" style="margin-top: 8px;">
             <div>🔑 API Key: <code>${{b.api_key}}</code></div>
             <div>🌐 Language: <code>${{b.language || 'pl'}}</code> | 💰 Currency: <code>${{b.default_currency || 'PLN'}}</code> | 💬 Allowed Chats: <code>${{(b.allowed_chat_ids && b.allowed_chat_ids.length) ? b.allowed_chat_ids.join(', ') : 'Any'}}</code></div>
+            <div>📤 Delivery Modes: ${{(b.delivery_modes && b.delivery_modes.length) ? b.delivery_modes.map(m => `<code>${{m}}</code>`).join(' ') : '<code>none (catalog only)</code>'}}</div>
             <div>🔗 Destination Webhook: <code>${{b.webhook_url || 'Not configured'}}</code></div>
           </div>
         </div>
@@ -759,6 +813,23 @@ def render_dashboard_html() -> str:
       document.getElementById('testApiKey').value = key;
     }}
 
+    function setDeliveryModeCheckboxes(modes) {{
+      const set = new Set(modes || []);
+      document.getElementById('modeHubDb').checked = set.has('hub_db');
+      document.getElementById('modeWebhook').checked = set.has('webhook');
+      document.getElementById('modeTgText').checked = set.has('telegram_text');
+      document.getElementById('modeTgCsv').checked = set.has('telegram_csv');
+    }}
+
+    function collectDeliveryModes() {{
+      const modes = [];
+      if (document.getElementById('modeHubDb').checked) modes.push('hub_db');
+      if (document.getElementById('modeWebhook').checked) modes.push('webhook');
+      if (document.getElementById('modeTgText').checked) modes.push('telegram_text');
+      if (document.getElementById('modeTgCsv').checked) modes.push('telegram_csv');
+      return modes;
+    }}
+
     function editBot(id) {{
       const b = cachedBots.find(x => x.id === id);
       if (!b) return;
@@ -772,6 +843,7 @@ def render_dashboard_html() -> str:
       document.getElementById('allowedChatIds').value = (b.allowed_chat_ids || []).join(', ');
       document.getElementById('webhookUrl').value = b.webhook_url || '';
       document.getElementById('webhookSecret').value = '';
+      setDeliveryModeCheckboxes(b.delivery_modes || ['webhook']);
       window.scrollTo({{ top: 0, behavior: 'smooth' }});
     }}
 
@@ -786,6 +858,7 @@ def render_dashboard_html() -> str:
       document.getElementById('allowedChatIds').value = '';
       document.getElementById('webhookUrl').value = '';
       document.getElementById('webhookSecret').value = '';
+      setDeliveryModeCheckboxes(['hub_db', 'webhook']);
       document.getElementById('formStatus').innerText = '';
     }}
 
@@ -801,6 +874,7 @@ def render_dashboard_html() -> str:
         name: document.getElementById('botName').value.trim(),
         default_currency: document.getElementById('botCurrency').value.trim() || 'PLN',
         language: document.getElementById('botLanguage').value || 'pl',
+        delivery_modes: collectDeliveryModes(),
         allowed_chat_ids: chatIds,
         webhook_url: document.getElementById('webhookUrl').value.trim() || null,
       }};
@@ -856,6 +930,7 @@ def render_dashboard_html() -> str:
       const apiKey = document.getElementById('testApiKey').value.trim();
       const fileInput = document.getElementById('testFile');
       const sendWebhook = document.getElementById('testSendWebhook').checked;
+      const saveHubDb = document.getElementById('testSaveHubDb').checked;
       const statusEl = document.getElementById('ocrStatus');
       const outEl = document.getElementById('ocrOutput');
 
@@ -865,6 +940,7 @@ def render_dashboard_html() -> str:
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
       formData.append('forward_to_webhook', sendWebhook ? 'true' : 'false');
+      formData.append('save_to_hub_db', saveHubDb ? 'true' : 'false');
 
       statusEl.innerText = '⏳ Running Stage 1 (Vision OCR) -> Stage 2 (Classifier)...';
       outEl.innerText = '';

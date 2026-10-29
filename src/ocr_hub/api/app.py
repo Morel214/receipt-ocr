@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from ocr_hub import config
 from ocr_hub.api.auth import (
@@ -34,8 +34,8 @@ from ocr_hub.db.models import (
     TenantUpdateConfigRequest,
 )
 from ocr_hub.db.schema import init_db
-from ocr_hub.repositories import catalog_repo, jobs_repo, taxonomy_repo, tenants_repo
-from ocr_hub.services import ocr_engine, queue_service, webhook_dispatcher
+from ocr_hub.repositories import catalog_repo, jobs_repo, receipts_repo, taxonomy_repo, tenants_repo
+from ocr_hub.services import export_service, ocr_engine, queue_service, webhook_dispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ def _serialize_tenant(tenant: dict[str, Any], include_secrets: bool = True) -> d
         "has_webhook_secret": bool(tenant.get("webhook_secret")),
         "default_currency": tenant.get("default_currency", "PLN"),
         "language": tenant.get("language", "pl"),
+        "delivery_modes": tenant.get("delivery_modes", ["webhook"]),
         "subcategories": taxonomy_repo.get_active_subcategory_codes(),
         "ocr_provider": tenant.get("ocr_provider") or config.OCR_PROVIDER,
         "ocr_model": tenant.get("ocr_model") or config.OCR_MODEL,
@@ -126,6 +127,7 @@ async def _handle_ocr_parse(
     language: str | None,
     subcategories: str | None,
     forward_to_webhook: bool,
+    save_to_hub_db: bool,
     tenant: dict[str, Any],
 ) -> dict[str, Any]:
     """Shared implementation for /api/ocr and /api/v1/ocr/parse."""
@@ -195,6 +197,15 @@ async def _handle_ocr_parse(
         ],
     }
 
+    if save_to_hub_db:
+        saved_rec = await asyncio.to_thread(
+            receipts_repo.save_confirmed_receipt,
+            tenant_id=int(tenant["id"]),
+            result=ocr_result,
+            job_id=None,
+        )
+        response_data["hub_receipt_id"] = int(saved_rec["id"])
+
     if forward_to_webhook and tenant.get("webhook_url"):
         try:
             delivery = await asyncio.to_thread(
@@ -221,6 +232,7 @@ async def parse_receipt_simple(
     language: str | None = Form(default=None),
     subcategories: str | None = Form(default=None),
     forward_to_webhook: bool = Form(default=False),
+    save_to_hub_db: bool = Form(default=False),
     tenant: dict[str, Any] = Depends(get_current_tenant),
 ) -> dict[str, Any]:
     """Primary simplified OCR endpoint: upload receipt image -> Stage 1 OCR -> Stage 2 Classifier -> JSON."""
@@ -234,6 +246,7 @@ async def parse_receipt_simple(
         language=language,
         subcategories=subcategories,
         forward_to_webhook=forward_to_webhook,
+        save_to_hub_db=save_to_hub_db,
         tenant=tenant,
     )
 
@@ -249,6 +262,7 @@ async def parse_receipt_v1_alias(
     language: str | None = Form(default=None),
     subcategories: str | None = Form(default=None),
     forward_to_webhook: bool = Form(default=False),
+    save_to_hub_db: bool = Form(default=False),
     tenant: dict[str, Any] = Depends(get_current_tenant),
 ) -> dict[str, Any]:
     """Backward-compatible alias for /api/ocr."""
@@ -262,6 +276,7 @@ async def parse_receipt_v1_alias(
         language=language,
         subcategories=subcategories,
         forward_to_webhook=forward_to_webhook,
+        save_to_hub_db=save_to_hub_db,
         tenant=tenant,
     )
 
@@ -310,6 +325,7 @@ async def create_bot(payload: TenantCreateRequest) -> dict[str, Any]:
             webhook_secret=payload.webhook_secret,
             default_currency=payload.default_currency,
             language=payload.language,
+            delivery_modes=payload.delivery_modes,
             subcategories=payload.subcategories,
             ocr_provider=payload.ocr_provider,
             ocr_model=payload.ocr_model,
@@ -422,6 +438,62 @@ async def list_my_jobs(
 ) -> list[dict[str, Any]]:
     """List receipt jobs belonging to the authenticated user."""
     return jobs_repo.list_jobs(tenant_id=tenant["id"], status=job_status)
+
+
+@app.get("/api/receipts", tags=["Stored Receipts (hub_db)"])
+async def list_my_receipts(
+    month: str | None = Query(default=None, description="Optional YYYY-MM month prefix filter"),
+    include_items: bool = Query(default=False, description="Include line items for each receipt"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> dict[str, Any]:
+    """List confirmed receipts persisted in Hub DB for the authenticated user."""
+    rows = receipts_repo.list_receipts(
+        tenant_id=int(tenant["id"]),
+        month=month,
+        limit=limit,
+        offset=offset,
+        include_items=include_items,
+    )
+    return {
+        "receipts": rows,
+        "count": len(rows),
+        "hub_db_enabled": "hub_db" in (tenant.get("delivery_modes") or []),
+    }
+
+
+@app.get("/api/receipts/export.csv", tags=["Stored Receipts (hub_db)"])
+async def export_my_receipts_csv(
+    month: str | None = Query(default=None, description="Optional YYYY-MM month prefix filter"),
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> Response:
+    """Download saved Hub DB receipts for the authenticated user as a UTF-8 CSV file."""
+    rows = receipts_repo.list_receipts(
+        tenant_id=int(tenant["id"]),
+        month=month,
+        limit=5000,
+        include_items=True,
+    )
+    csv_bytes = export_service.format_receipts_csv_bytes(rows)
+    filename = f"receipts_{month.strip()}.csv" if month and month.strip() else "receipts_all.csv"
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/receipts/{receipt_id}", tags=["Stored Receipts (hub_db)"])
+async def get_my_receipt(
+    receipt_id: int,
+    tenant: dict[str, Any] = Depends(get_current_tenant),
+) -> dict[str, Any]:
+    """Retrieve a single stored Hub DB receipt and all its line items."""
+    receipt = receipts_repo.get_receipt(receipt_id, tenant_id=int(tenant["id"]))
+    if receipt is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
+    return receipt
 
 
 # ==============================================================================

@@ -262,6 +262,25 @@ def update_job_image_path(
         )
 
 
+def clear_job_payload(
+    job_id: int,
+    database_path: str | Path | None = None,
+) -> None:
+    """Scrub detailed line-item JSON and image path from a confirmed job when hub_db persistence is disabled."""
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE receipt_jobs
+            SET ocr_json = NULL,
+                items_json = NULL,
+                image_path = NULL
+            WHERE id = ?;
+            """,
+            (job_id,),
+        )
+
+
 def list_open_jobs(
     tenant_id: int,
     database_path: str | Path | None = None,

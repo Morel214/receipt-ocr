@@ -19,6 +19,7 @@ class ReceiptItem(BaseModel):
     total_price: float = Field(ge=-1000000)
     confidence: float | None = Field(default=None, ge=0, le=1)
     product_id: int | None = None
+    alias_id: int | None = None
     name_pl: str | None = None
     name_en: str | None = None
     brand: str | None = None
@@ -75,6 +76,23 @@ class ReceiptOCRResult(BaseModel):
 
 
 SUPPORTED_LANGUAGES = ("en", "pl")
+VALID_DELIVERY_MODES = ("hub_db", "webhook", "telegram_text", "telegram_csv")
+
+
+def normalize_delivery_modes(modes: list[str]) -> list[str]:
+    """Validate and deduplicate delivery mode identifiers while preserving order."""
+    normalized: list[str] = []
+    for raw_mode in modes:
+        mode = str(raw_mode).strip().lower()
+        if not mode:
+            continue
+        if mode not in VALID_DELIVERY_MODES:
+            raise ValueError(
+                f"Unsupported delivery mode '{raw_mode}'. Allowed: {VALID_DELIVERY_MODES}"
+            )
+        if mode not in normalized:
+            normalized.append(mode)
+    return normalized
 
 
 class TenantCreateRequest(BaseModel):
@@ -87,6 +105,7 @@ class TenantCreateRequest(BaseModel):
     webhook_secret: str | None = None
     default_currency: str = Field(default="PLN", max_length=10)
     language: str = Field(default="pl", max_length=10)
+    delivery_modes: list[str] = Field(default_factory=lambda: ["webhook"])
     subcategories: list[str] | None = None
     ocr_provider: str | None = None
     ocr_model: str | None = None
@@ -102,6 +121,12 @@ class TenantCreateRequest(BaseModel):
             raise ValueError(f"Unsupported language '{value}'. Allowed: {SUPPORTED_LANGUAGES}")
         return lang
 
+    @field_validator("delivery_modes")
+    @classmethod
+    def validate_delivery_modes(cls, value: list[str]) -> list[str]:
+        """Validate requested post-confirmation delivery modes."""
+        return normalize_delivery_modes(value)
+
 
 class TenantUpdateConfigRequest(BaseModel):
     """Update payload for a bot/user configuration."""
@@ -111,6 +136,7 @@ class TenantUpdateConfigRequest(BaseModel):
     webhook_secret: str | None = None
     default_currency: str | None = Field(default=None, max_length=10)
     language: str | None = Field(default=None, max_length=10)
+    delivery_modes: list[str] | None = None
     subcategories: list[str] | None = None
     ocr_provider: str | None = None
     ocr_model: str | None = None
@@ -130,6 +156,14 @@ class TenantUpdateConfigRequest(BaseModel):
         if lang not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language '{value}'. Allowed: {SUPPORTED_LANGUAGES}")
         return lang
+
+    @field_validator("delivery_modes")
+    @classmethod
+    def validate_optional_delivery_modes(cls, value: list[str] | None) -> list[str] | None:
+        """Validate optional post-confirmation delivery modes update."""
+        if value is None:
+            return None
+        return normalize_delivery_modes(value)
 
 
 class CategoryCreateRequest(BaseModel):

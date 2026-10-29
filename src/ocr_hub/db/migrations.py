@@ -342,12 +342,88 @@ def _migration_002_shared_catalog_and_taxonomy_approval(cursor: sqlite3.Cursor) 
     )
 
 
+def _migration_003_delivery_modes_and_opt_in_receipts(cursor: sqlite3.Cursor) -> None:
+    """Add delivery_modes_json to tenants and create opt-in receipts & receipt_items tables."""
+    cursor.execute("PRAGMA table_info(tenants);")
+    tenant_cols = {row[1] for row in cursor.fetchall()}
+    if "delivery_modes_json" not in tenant_cols:
+        cursor.execute(
+            """
+            ALTER TABLE tenants
+            ADD COLUMN delivery_modes_json TEXT NOT NULL DEFAULT '["webhook"]';
+            """
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id INTEGER NOT NULL,
+            job_id INTEGER UNIQUE,
+            store_id INTEGER,
+            store_name TEXT NOT NULL,
+            transaction_date TEXT,
+            total_amount REAL NOT NULL DEFAULT 0.0,
+            currency TEXT NOT NULL DEFAULT 'PLN',
+            confidence REAL,
+            cache_hits INTEGER NOT NULL DEFAULT 0,
+            llm_classified_count INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE,
+            FOREIGN KEY (store_id) REFERENCES stores (id) ON DELETE SET NULL
+        );
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_receipts_tenant_date ON receipts(tenant_id, transaction_date);"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS receipt_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_id INTEGER NOT NULL,
+            line_no INTEGER NOT NULL,
+            raw_name TEXT NOT NULL,
+            clean_name TEXT NOT NULL,
+            category_code TEXT,
+            subcategory_code TEXT,
+            product_id INTEGER,
+            alias_id INTEGER,
+            unit TEXT NOT NULL DEFAULT 'pcs',
+            quantity REAL NOT NULL DEFAULT 1.0,
+            unit_price REAL NOT NULL,
+            total_price REAL NOT NULL,
+            brand TEXT,
+            off_search_query TEXT,
+            pack_amount REAL,
+            pack_unit TEXT,
+            match_source TEXT NOT NULL DEFAULT 'llm',
+            FOREIGN KEY (receipt_id) REFERENCES receipts (id) ON DELETE CASCADE,
+            FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE SET NULL,
+            FOREIGN KEY (alias_id) REFERENCES product_aliases (id) ON DELETE SET NULL
+        );
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt ON receipt_items(receipt_id);"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_receipt_items_product ON receipt_items(product_id);"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Cursor], None]]] = [
     (1, "001_global_taxonomy_categories_and_subcategories", _migration_001_global_taxonomy),
     (
         2,
         "002_shared_catalog_and_taxonomy_approval",
         _migration_002_shared_catalog_and_taxonomy_approval,
+    ),
+    (
+        3,
+        "003_delivery_modes_and_opt_in_receipts",
+        _migration_003_delivery_modes_and_opt_in_receipts,
     ),
 ]
 

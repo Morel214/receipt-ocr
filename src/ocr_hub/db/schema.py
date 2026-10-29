@@ -29,6 +29,7 @@ def init_db(database_path: str | Path | None = None) -> None:
                 ocr_model TEXT,
                 classifier_provider TEXT,
                 classifier_model TEXT,
+                delivery_modes_json TEXT NOT NULL DEFAULT '["webhook"]',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP

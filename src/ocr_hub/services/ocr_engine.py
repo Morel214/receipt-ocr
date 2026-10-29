@@ -429,19 +429,21 @@ def commit_result_to_catalog(
 
         # Already matched from cache and untouched -> increment hit counter
         if item.match_source == "cache" and item.product_id:
-            catalog_repo.lookup_alias(
+            hit = catalog_repo.lookup_alias(
                 item.name,
                 store_id=store_id,
                 increment_hit=True,
                 database_path=database_path,
             )
+            if hit is not None:
+                item.alias_id = int(hit["alias_id"])
             continue
 
         item_source = "user" if item.match_source == "user" else source
         item_status = "confirmed" if item_source in ("user", "admin") else "auto"
 
         product = None
-        if item.product_id and item_source != "user":
+        if item.product_id:
             product = catalog_repo.get_product_by_id(item.product_id, database_path=database_path)
 
         if product is None:
@@ -460,6 +462,21 @@ def commit_result_to_catalog(
                 database_path=database_path,
             )
 
+        if item_source in ("user", "admin") and product is not None:
+            needs_upgrade = product.get("status") != "confirmed" or (
+                item.subcategory
+                and item.subcategory.lower() != str(product.get("subcategory_code") or "").lower()
+            )
+            if needs_upgrade:
+                updated_prod = catalog_repo.update_product(
+                    int(product["id"]),
+                    status="confirmed",
+                    subcategory_code=item.subcategory or product.get("subcategory_code"),
+                    database_path=database_path,
+                )
+                if updated_prod is not None:
+                    product = updated_prod
+
         alias = catalog_repo.upsert_alias(
             raw_name=item.name,
             product_id=int(product["id"]),
@@ -473,6 +490,7 @@ def commit_result_to_catalog(
             database_path=database_path,
         )
         item.product_id = int(product["id"])
+        item.alias_id = int(alias["alias_id"])
         item.name_pl = product["name_pl"]
         item.name_en = product["name_en"]
         if product.get("subcategory_code"):
@@ -567,6 +585,7 @@ def analyze_receipt_image(
         if cached is not None:
             cache_hits += 1
             item["product_id"] = int(cached["product_id"])
+            item["alias_id"] = int(cached["alias_id"])
             item["name_pl"] = cached["name_pl"]
             item["name_en"] = cached["name_en"]
             item["clean_name"] = cached["name_pl"] if lang == "pl" else cached["name_en"]
