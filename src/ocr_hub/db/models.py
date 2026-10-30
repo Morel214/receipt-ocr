@@ -208,6 +208,99 @@ class SubcategoryUpdateRequest(BaseModel):
     is_active: bool | None = None
 
 
+VALID_CATALOG_STATUSES = ("auto", "confirmed", "pending")
+
+
+class CatalogProductCreateRequest(BaseModel):
+    """Payload for creating a product in the shared catalog (or pending manual_user queue)."""
+
+    name_pl: str = Field(min_length=1, max_length=150)
+    name_en: str = Field(min_length=1, max_length=150)
+    subcategory_code: str | None = Field(default=None, max_length=60)
+    default_unit: str = Field(default="pcs", max_length=20)
+
+    @field_validator("default_unit", mode="before")
+    @classmethod
+    def validate_unit(cls, value: Any) -> str:
+        return ReceiptItem.normalize_unit(value)
+
+
+class CatalogProductUpdateRequest(BaseModel):
+    """Payload for Admin edits to a shared catalog product."""
+
+    name_pl: str | None = Field(default=None, min_length=1, max_length=150)
+    name_en: str | None = Field(default=None, min_length=1, max_length=150)
+    subcategory_code: str | None = Field(default=None, max_length=60)
+    default_unit: str | None = Field(default=None, max_length=20)
+    status: str | None = Field(default=None, max_length=20)
+    kcal_100g: float | None = None
+    protein_100g: float | None = None
+    carbs_100g: float | None = None
+    fat_100g: float | None = None
+    fiber_100g: float | None = None
+    default_piece_weight_g: float | None = None
+    nutrition_source: str | None = Field(default=None, max_length=30)
+
+    @field_validator("default_unit", mode="before")
+    @classmethod
+    def validate_optional_unit(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return ReceiptItem.normalize_unit(value)
+
+    @field_validator("status")
+    @classmethod
+    def validate_optional_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip().lower()
+        if clean not in VALID_CATALOG_STATUSES:
+            raise ValueError(
+                f"Unsupported product status '{value}'. Allowed: {VALID_CATALOG_STATUSES}"
+            )
+        return clean
+
+
+class CatalogProductMergeRequest(BaseModel):
+    """Payload for merging a duplicate source product into a canonical target product."""
+
+    target_product_id: int = Field(gt=0)
+
+
+class CatalogAliasCreateRequest(BaseModel):
+    """Payload for manually adding or overriding a receipt item alias in the catalog cache."""
+
+    raw_name: str = Field(min_length=1, max_length=200)
+    product_id: int = Field(gt=0)
+    store_id: int | None = None
+    brand: str | None = Field(default=None, max_length=120)
+    off_search_query: str | None = Field(default=None, max_length=200)
+    pack_amount: float | None = None
+    pack_unit: str | None = Field(default=None, max_length=20)
+
+
+class CatalogAliasUpdateRequest(BaseModel):
+    """Payload for editing an existing receipt item alias mapping or OFF metadata."""
+
+    product_id: int | None = Field(default=None, gt=0)
+    store_id: int | None = None
+    brand: str | None = Field(default=None, max_length=120)
+    off_search_query: str | None = Field(default=None, max_length=200)
+    pack_amount: float | None = None
+    pack_unit: str | None = Field(default=None, max_length=20)
+    status: str | None = Field(default=None, max_length=20)
+
+    @field_validator("status")
+    @classmethod
+    def validate_alias_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip().lower()
+        if clean not in ("auto", "confirmed"):
+            raise ValueError("Alias status must be 'auto' or 'confirmed'.")
+        return clean
+
+
 class WebhookDeliveryPayload(BaseModel):
     """Payload sent to a user's configured webhook URL upon receipt confirmation."""
 

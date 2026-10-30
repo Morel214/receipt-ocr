@@ -205,6 +205,8 @@ _PRODUCT_SELECT_SQL = """
         p.fiber_100g,
         p.default_piece_weight_g,
         p.nutrition_source,
+        (SELECT COUNT(*) FROM product_aliases pa WHERE pa.product_id = p.id) AS alias_count,
+        (SELECT COALESCE(SUM(pa.hit_count), 0) FROM product_aliases pa WHERE pa.product_id = p.id) AS total_hits,
         p.created_at,
         p.updated_at
     FROM products p
@@ -419,6 +421,184 @@ def list_products(
         cursor.execute(query, params)
         cols = [c[0] for c in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def query_products(
+    q: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+    subcategory_code: str | None = None,
+    include_pending: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+    database_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Browse and search catalog products with FTS5 typo tolerance plus alias/brand substring matching."""
+    status_clean = status.strip().lower() if status and status.strip() else None
+    if status_clean == "pending" and not include_pending:
+        return []
+
+    sub_clean = subcategory_code.strip().lower() if subcategory_code and subcategory_code.strip() else None
+    source_clean = source.strip().lower() if source and source.strip() else None
+    search_text = q.strip() if q and q.strip() else ""
+
+    def _matches_filters(prod: dict[str, Any]) -> bool:
+        p_status = str(prod.get("status") or "")
+        if not include_pending and p_status == "pending":
+            return False
+        if status_clean and p_status != status_clean:
+            return False
+        if source_clean and str(prod.get("source") or "").lower() != source_clean:
+            return False
+        if sub_clean and str(prod.get("subcategory_code") or "").lower() != sub_clean:
+            return False
+        return True
+
+    if not search_text:
+        query = f"{_PRODUCT_SELECT_SQL} WHERE 1 = 1"
+        params: list[Any] = []
+        if status_clean:
+            query += " AND p.status = ?"
+            params.append(status_clean)
+        elif not include_pending:
+            query += " AND p.status IN ('auto', 'confirmed')"
+        if source_clean:
+            query += " AND LOWER(p.source) = ?"
+            params.append(source_clean)
+        if sub_clean:
+            query += " AND LOWER(s.code) = ?"
+            params.append(sub_clean)
+        query += " ORDER BY total_hits DESC, p.id DESC LIMIT ? OFFSET ?;"
+        params.extend([int(limit), int(offset)])
+        with get_connection(database_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            cols = [c[0] for c in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    # Search mode: prioritize exact/substring product & alias/brand/OFF matches first, then typo-tolerant FTS5
+    combined: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    norm_prod_q = normalize_clean_product_name(search_text)
+    norm_raw_q = normalize_raw_item_name(search_text)
+    like_prod = f"%{norm_prod_q}%" if norm_prod_q else f"%{search_text.lower()}%"
+    like_raw = f"%{norm_raw_q}%" if norm_raw_q else f"%{search_text.upper()}%"
+    like_folded_lower = f"%{fold_polish_ascii(search_text).lower().strip()}%"
+
+    sql = f"""
+        {_PRODUCT_SELECT_SQL}
+        WHERE (
+            p.name_pl_norm LIKE ?
+            OR p.name_en_norm LIKE ?
+            OR LOWER(p.name_pl) LIKE ?
+            OR LOWER(p.name_en) LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM product_aliases pa
+                WHERE pa.product_id = p.id
+                  AND (
+                      pa.raw_name_norm LIKE ?
+                      OR LOWER(COALESCE(pa.brand, '')) LIKE ?
+                      OR LOWER(COALESCE(pa.off_search_query, '')) LIKE ?
+                  )
+            )
+        )
+        ORDER BY
+            CASE
+                WHEN p.name_pl_norm LIKE ? OR p.name_en_norm LIKE ? THEN 0
+                ELSE 1
+            END,
+            total_hits DESC,
+            p.id DESC
+        LIMIT ?;
+    """
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            sql,
+            (
+                like_prod,
+                like_prod,
+                f"%{search_text.lower()}%",
+                f"%{search_text.lower()}%",
+                like_raw,
+                like_folded_lower,
+                like_folded_lower,
+                like_prod,
+                like_prod,
+                max(int(limit) + int(offset) + 30, 80),
+            ),
+        )
+        cols = [c[0] for c in cursor.description]
+        for row in cursor.fetchall():
+            item = dict(zip(cols, row))
+            pid = int(item["id"])
+            if pid not in seen_ids and _matches_filters(item):
+                seen_ids.add(pid)
+                combined.append(item)
+
+    fts_hits = search_products_fts(
+        search_text,
+        limit=max(int(limit) + int(offset), 40),
+        include_pending=include_pending,
+        database_path=database_path,
+    )
+    for item in fts_hits:
+        pid = int(item["id"])
+        if pid not in seen_ids and _matches_filters(item):
+            seen_ids.add(pid)
+            combined.append(item)
+
+    return combined[int(offset) : int(offset) + int(limit)]
+
+
+def approve_product(
+    product_id: int,
+    approve_aliases: bool = True,
+    database_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Approve an ``auto`` or ``pending`` product into ``confirmed`` active catalog status."""
+    existing = get_product_by_id(product_id, database_path=database_path)
+    if existing is None:
+        return None
+
+    # If a pending manual_user product duplicates an already-active product, merge into canonical
+    if existing.get("status") == "pending":
+        duplicate_active = find_product_by_clean_name(
+            name_pl=existing["name_pl"],
+            name_en=existing["name_en"],
+            include_pending=False,
+            database_path=database_path,
+        )
+        if duplicate_active is not None and int(duplicate_active["id"]) != int(product_id):
+            merged = merge_products(
+                source_product_id=int(product_id),
+                target_product_id=int(duplicate_active["id"]),
+                database_path=database_path,
+            )
+            return update_product(int(merged["id"]), status="confirmed", database_path=database_path)
+
+    updated = update_product(product_id, status="confirmed", database_path=database_path)
+    if approve_aliases and updated is not None:
+        with get_connection(database_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE product_aliases SET status = 'confirmed' WHERE product_id = ? AND status = 'auto';",
+                (int(product_id),),
+            )
+        updated = get_product_by_id(product_id, database_path=database_path)
+    return updated
+
+
+def delete_product(
+    product_id: int,
+    database_path: str | Path | None = None,
+) -> bool:
+    """Delete a product (and its cascaded aliases) from the catalog."""
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM products WHERE id = ?;", (int(product_id),))
+        return cursor.rowcount > 0
 
 
 def _extract_trigrams(norm_query: str) -> list[str]:
@@ -778,6 +958,156 @@ def list_aliases(
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
+def query_aliases(
+    q: str | None = None,
+    product_id: int | None = None,
+    store_id: int | None = None,
+    status: str | None = None,
+    source: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    database_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Search and filter receipt aliases across raw names, clean products, brands, and OFF queries."""
+    query = f"{_ALIAS_SELECT_SQL} WHERE 1 = 1"
+    params: list[Any] = []
+    if product_id is not None:
+        query += " AND a.product_id = ?"
+        params.append(int(product_id))
+    if store_id is not None:
+        query += " AND a.store_id = ?"
+        params.append(int(store_id))
+    if status and status.strip():
+        query += " AND a.status = ?"
+        params.append(status.strip().lower())
+    if source and source.strip():
+        query += " AND LOWER(a.source) = ?"
+        params.append(source.strip().lower())
+
+    if q and q.strip():
+        raw_text = q.strip()
+        norm_raw = normalize_raw_item_name(raw_text)
+        norm_clean = normalize_clean_product_name(raw_text)
+        like_raw = f"%{norm_raw}%" if norm_raw else f"%{raw_text.upper()}%"
+        like_clean = f"%{norm_clean}%" if norm_clean else f"%{raw_text.lower()}%"
+        like_lower = f"%{raw_text.lower()}%"
+        query += """
+            AND (
+                a.raw_name_norm LIKE ?
+                OR LOWER(a.raw_name_original) LIKE ?
+                OR p.name_pl_norm LIKE ?
+                OR p.name_en_norm LIKE ?
+                OR LOWER(COALESCE(a.brand, '')) LIKE ?
+                OR LOWER(COALESCE(a.off_search_query, '')) LIKE ?
+                OR LOWER(COALESCE(st.display_name, '')) LIKE ?
+            )
+        """
+        params.extend(
+            [like_raw, like_lower, like_clean, like_clean, like_lower, like_lower, like_lower]
+        )
+
+    query += " ORDER BY a.hit_count DESC, a.id DESC LIMIT ? OFFSET ?;"
+    params.extend([int(limit), int(offset)])
+
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        cols = [c[0] for c in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def update_alias(
+    alias_id: int,
+    database_path: str | Path | None = None,
+    **fields: Any,
+) -> dict[str, Any] | None:
+    """Update an existing alias mapping (e.g. re-point product_id, edit brand/OFF query, confirm status)."""
+    existing = get_alias_by_id(alias_id, database_path=database_path)
+    if existing is None:
+        return None
+
+    if "product_id" in fields and fields["product_id"] is not None:
+        target_prod = get_product_by_id(int(fields["product_id"]), database_path=database_path)
+        if target_prod is None:
+            raise ValueError(f"Target product #{fields['product_id']} not found.")
+        fields["product_id"] = int(fields["product_id"])
+
+    for nullable_str in ("brand", "off_search_query", "pack_unit"):
+        if nullable_str in fields and fields[nullable_str] is not None:
+            cleaned = str(fields[nullable_str]).strip()
+            if nullable_str == "pack_unit":
+                cleaned = cleaned.lower()
+            fields[nullable_str] = cleaned if cleaned else None
+
+    if "status" not in fields or fields["status"] is None:
+        fields["status"] = "confirmed"
+    if "source" not in fields or fields["source"] is None:
+        fields["source"] = "admin"
+
+    allowed = {
+        "product_id",
+        "store_id",
+        "brand",
+        "off_search_query",
+        "pack_amount",
+        "pack_unit",
+        "status",
+        "source",
+    }
+    updates: list[str] = []
+    params: list[Any] = []
+    for col, val in fields.items():
+        if col in allowed:
+            updates.append(f"{col} = ?")
+            params.append(val)
+
+    if not updates:
+        return existing
+
+    params.append(int(alias_id))
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE product_aliases SET {', '.join(updates)} WHERE id = ?;",
+            params,
+        )
+        # If product_id changed and receipt_items tracks alias_id, sync historical receipt_items.product_id
+        if "product_id" in fields and fields["product_id"] is not None:
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_items';"
+            )
+            if cursor.fetchone():
+                cursor.execute(
+                    "UPDATE receipt_items SET product_id = ? WHERE alias_id = ?;",
+                    (int(fields["product_id"]), int(alias_id)),
+                )
+
+    return get_alias_by_id(alias_id, database_path=database_path)
+
+
+def approve_alias(
+    alias_id: int,
+    database_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Mark an ``auto`` alias (and its parent ``auto`` product if needed) as ``confirmed``."""
+    updated = update_alias(alias_id, status="confirmed", database_path=database_path)
+    if updated is not None and updated.get("product_status") == "auto":
+        update_product(int(updated["product_id"]), status="confirmed", database_path=database_path)
+        updated = get_alias_by_id(alias_id, database_path=database_path)
+    return updated
+
+
+def delete_alias(
+    alias_id: int,
+    database_path: str | Path | None = None,
+) -> bool:
+    """Delete a product alias from the OCR cache."""
+    with get_connection(database_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM product_aliases WHERE id = ?;", (int(alias_id),))
+        return cursor.rowcount > 0
+
+
 def merge_products(
     source_product_id: int,
     target_product_id: int,
@@ -796,6 +1126,11 @@ def merge_products(
 
     with get_connection(database_path) as conn:
         cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_items';"
+        )
+        has_receipt_items = cursor.fetchone() is not None
+
         cursor.execute(
             "SELECT id, store_id, raw_name_norm, hit_count FROM product_aliases WHERE product_id = ?;",
             (source_product_id,),
@@ -817,6 +1152,11 @@ def merge_products(
                     "UPDATE product_aliases SET hit_count = hit_count + ? WHERE id = ?;",
                     (int(hits), int(conflict[0])),
                 )
+                if has_receipt_items:
+                    cursor.execute(
+                        "UPDATE receipt_items SET alias_id = ? WHERE alias_id = ?;",
+                        (int(conflict[0]), int(alias_id)),
+                    )
                 cursor.execute("DELETE FROM product_aliases WHERE id = ?;", (int(alias_id),))
             else:
                 cursor.execute(
@@ -824,14 +1164,16 @@ def merge_products(
                     (target_product_id, int(alias_id)),
                 )
 
-        # If receipt_items table exists (Phase 4+), re-point historical receipt items as well
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='receipt_items';"
-        )
-        if cursor.fetchone():
+        if has_receipt_items:
             cursor.execute(
                 "UPDATE receipt_items SET product_id = ? WHERE product_id = ?;",
                 (target_product_id, source_product_id),
+            )
+
+        if source.get("status") == "confirmed" and target.get("status") == "auto":
+            cursor.execute(
+                "UPDATE products SET status = 'confirmed' WHERE id = ?;",
+                (target_product_id,),
             )
 
         cursor.execute("DELETE FROM products WHERE id = ?;", (source_product_id,))
@@ -842,7 +1184,7 @@ def merge_products(
 
 
 def get_catalog_stats(database_path: str | Path | None = None) -> dict[str, Any]:
-    """Return summary counts for products, aliases, cache hits, stores, and pending items."""
+    """Return summary counts for products, aliases, cache hit efficiency, stores, and pending items."""
     with get_connection(database_path) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM products;")
@@ -862,6 +1204,12 @@ def get_catalog_stats(database_path: str | Path | None = None) -> dict[str, Any]
         aliases_total = int(alias_row[0])
         total_alias_hits = int(alias_row[1])
 
+        cursor.execute("SELECT COUNT(*) FROM product_aliases WHERE status = 'confirmed';")
+        aliases_confirmed = int(cursor.fetchone()[0])
+
+        cursor.execute("SELECT COUNT(*) FROM product_aliases WHERE status = 'auto';")
+        aliases_auto = int(cursor.fetchone()[0])
+
         cursor.execute("SELECT COUNT(*) FROM stores;")
         stores_total = int(cursor.fetchone()[0])
 
@@ -870,13 +1218,25 @@ def get_catalog_stats(database_path: str | Path | None = None) -> dict[str, Any]
         cursor.execute("SELECT COUNT(*) FROM subcategories WHERE status = 'pending';")
         pending_subs = int(cursor.fetchone()[0])
 
+    repeat_cache_hits = max(0, total_alias_hits - aliases_total)
+    cache_hit_rate_pct = (
+        round((repeat_cache_hits / total_alias_hits) * 100.0, 1) if total_alias_hits > 0 else 0.0
+    )
+    pending_taxonomy_count = pending_cats + pending_subs
+
     return {
         "products_total": products_total,
+        "products_active": products_confirmed + products_auto,
         "products_confirmed": products_confirmed,
         "products_auto": products_auto,
         "products_pending": products_pending,
         "aliases_total": aliases_total,
+        "aliases_confirmed": aliases_confirmed,
+        "aliases_auto": aliases_auto,
         "total_alias_hits": total_alias_hits,
+        "repeat_cache_hits": repeat_cache_hits,
+        "cache_hit_rate_pct": cache_hit_rate_pct,
         "stores_total": stores_total,
-        "pending_taxonomy_count": pending_cats + pending_subs,
+        "pending_taxonomy_count": pending_taxonomy_count,
+        "manual_user_pending_total": pending_taxonomy_count + products_pending,
     }

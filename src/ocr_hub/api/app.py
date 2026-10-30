@@ -26,6 +26,11 @@ from ocr_hub.api.web_ui import render_dashboard_html
 from ocr_hub.bot.bot_manager import bot_manager
 from ocr_hub.db.migrations import list_applied_migrations
 from ocr_hub.db.models import (
+    CatalogAliasCreateRequest,
+    CatalogAliasUpdateRequest,
+    CatalogProductCreateRequest,
+    CatalogProductMergeRequest,
+    CatalogProductUpdateRequest,
     CategoryCreateRequest,
     CategoryUpdateRequest,
     SubcategoryCreateRequest,
@@ -685,7 +690,263 @@ async def delete_taxonomy_subcategory(subcategory_id: int) -> dict[str, Any]:
     return {"subcategory_id": subcategory_id, "deleted": True}
 
 
+# ==============================================================================
+# Shared Product Catalog, Aliases, Duplicate Merge & Manual User Review Queue
+# ==============================================================================
+
+
 @app.get("/api/catalog/stats", tags=["Catalog"])
 async def get_catalog_overview() -> dict[str, Any]:
-    """Return summary counts for the shared product catalog, aliases, stores, and pending suggestions."""
+    """Return summary counts and cache hit metrics for the shared product catalog."""
     return catalog_repo.get_catalog_stats()
+
+
+@app.get("/api/catalog/stores", tags=["Catalog"])
+async def list_catalog_stores() -> dict[str, Any]:
+    """Return all normalized retail store chains known to the catalog."""
+    stores = catalog_repo.list_stores()
+    return {"stores": stores, "count": len(stores)}
+
+
+@app.get(
+    "/api/catalog/manual-queue",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def get_manual_user_review_queue() -> dict[str, Any]:
+    """Return all unapproved manual_user suggestions (categories, subcategories, products) awaiting Admin approval."""
+    pending_tax = taxonomy_repo.list_pending_taxonomy()
+    pending_products = catalog_repo.query_products(
+        status="pending",
+        include_pending=True,
+        limit=500,
+    )
+    total = (
+        len(pending_tax["categories"])
+        + len(pending_tax["subcategories"])
+        + len(pending_products)
+    )
+    return {
+        "categories": pending_tax["categories"],
+        "subcategories": pending_tax["subcategories"],
+        "products": pending_products,
+        "total_pending": total,
+    }
+
+
+@app.get("/api/catalog/products", tags=["Catalog"])
+async def list_or_search_catalog_products(
+    q: str | None = Query(default=None, description="Typo-tolerant FTS5 & alias search query"),
+    product_status: str | None = Query(default=None, alias="status"),
+    subcategory: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    is_admin: bool = Depends(check_optional_admin_key),
+) -> dict[str, Any]:
+    """Browse or search catalog products (non-admin callers only see active 'auto' and 'confirmed' products)."""
+    products = catalog_repo.query_products(
+        q=q,
+        status=product_status,
+        subcategory_code=subcategory,
+        include_pending=is_admin,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "products": products,
+        "count": len(products),
+        "is_admin": is_admin,
+    }
+
+
+@app.post(
+    "/api/catalog/products",
+    status_code=status.HTTP_201_CREATED,
+    tags=["Catalog"],
+)
+async def create_catalog_product(
+    payload: CatalogProductCreateRequest,
+    is_admin: bool = Depends(check_optional_admin_key),
+) -> dict[str, Any]:
+    """Add a product to the catalog (confirmed immediately for Admin; queued in Manual User Queue otherwise)."""
+    try:
+        return catalog_repo.create_or_get_product(
+            name_pl=payload.name_pl,
+            name_en=payload.name_en,
+            subcategory_code=payload.subcategory_code,
+            default_unit=payload.default_unit,
+            status="confirmed" if is_admin else "pending",
+            source="admin" if is_admin else "manual_user",
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put(
+    "/api/catalog/products/{product_id}",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def update_catalog_product(
+    product_id: int,
+    payload: CatalogProductUpdateRequest,
+) -> dict[str, Any]:
+    """Edit a catalog product's PL/EN clean names, subcategory, unit, status, or nutrition fields (Admin Key required)."""
+    fields = payload.model_dump(exclude_unset=True)
+    if "status" not in fields:
+        fields["status"] = "confirmed"
+    try:
+        updated = catalog_repo.update_product(product_id, **fields)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    return updated
+
+
+@app.post(
+    "/api/catalog/products/{product_id}/approve",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def approve_catalog_product(product_id: int) -> dict[str, Any]:
+    """Approve an 'auto' LLM or 'pending' manual_user product (and its auto aliases) into 'confirmed' status."""
+    approved = catalog_repo.approve_product(product_id, approve_aliases=True)
+    if approved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    return approved
+
+
+@app.post(
+    "/api/catalog/products/{product_id}/merge",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def merge_catalog_product(
+    product_id: int,
+    payload: CatalogProductMergeRequest,
+) -> dict[str, Any]:
+    """Merge duplicate product ``product_id`` into ``payload.target_product_id``, re-pointing all aliases and receipts."""
+    try:
+        merged = catalog_repo.merge_products(
+            source_product_id=product_id,
+            target_product_id=payload.target_product_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "removed_product_id": product_id,
+        "target_product_id": payload.target_product_id,
+        "product": merged,
+    }
+
+
+@app.delete(
+    "/api/catalog/products/{product_id}",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def delete_catalog_product(product_id: int) -> dict[str, Any]:
+    """Delete a product and its cascaded aliases from the catalog (Admin Key required)."""
+    deleted = catalog_repo.delete_product(product_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    return {"product_id": product_id, "deleted": True}
+
+
+@app.get("/api/catalog/aliases", tags=["Catalog"])
+async def list_or_search_catalog_aliases(
+    q: str | None = Query(default=None, description="Filter by raw receipt text, brand, OFF query, or clean name"),
+    product_id: int | None = Query(default=None),
+    store_id: int | None = Query(default=None),
+    alias_status: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Browse or search cached store receipt aliases and Open Food Facts search queries."""
+    aliases = catalog_repo.query_aliases(
+        q=q,
+        product_id=product_id,
+        store_id=store_id,
+        status=alias_status,
+        limit=limit,
+        offset=offset,
+    )
+    return {"aliases": aliases, "count": len(aliases)}
+
+
+@app.post(
+    "/api/catalog/aliases",
+    dependencies=[Depends(require_strict_admin_key)],
+    status_code=status.HTTP_201_CREATED,
+    tags=["Catalog"],
+)
+async def create_or_override_catalog_alias(
+    payload: CatalogAliasCreateRequest,
+) -> dict[str, Any]:
+    """Manually register or override a store receipt alias mapping as confirmed (Admin Key required)."""
+    prod = catalog_repo.get_product_by_id(payload.product_id)
+    if prod is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target product not found")
+    try:
+        return catalog_repo.upsert_alias(
+            raw_name=payload.raw_name,
+            product_id=payload.product_id,
+            store_id=payload.store_id,
+            brand=payload.brand,
+            off_search_query=payload.off_search_query,
+            pack_amount=payload.pack_amount,
+            pack_unit=payload.pack_unit,
+            source="admin",
+            status="confirmed",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.put(
+    "/api/catalog/aliases/{alias_id}",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def update_catalog_alias(
+    alias_id: int,
+    payload: CatalogAliasUpdateRequest,
+) -> dict[str, Any]:
+    """Edit an existing receipt alias mapping, brand, or Open Food Facts search query (Admin Key required)."""
+    try:
+        updated = catalog_repo.update_alias(
+            alias_id,
+            **payload.model_dump(exclude_unset=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alias not found")
+    return updated
+
+
+@app.post(
+    "/api/catalog/aliases/{alias_id}/approve",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def approve_catalog_alias(alias_id: int) -> dict[str, Any]:
+    """Confirm an 'auto' receipt alias mapping (Admin Key required)."""
+    approved = catalog_repo.approve_alias(alias_id)
+    if approved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alias not found")
+    return approved
+
+
+@app.delete(
+    "/api/catalog/aliases/{alias_id}",
+    dependencies=[Depends(require_strict_admin_key)],
+    tags=["Catalog"],
+)
+async def delete_catalog_alias(alias_id: int) -> dict[str, Any]:
+    """Remove a cached receipt alias (Admin Key required)."""
+    deleted = catalog_repo.delete_alias(alias_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alias not found")
+    return {"alias_id": alias_id, "deleted": True}
